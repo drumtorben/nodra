@@ -196,3 +196,92 @@ pub async fn assert_matches_reference(sql: &str, streams: &[RecordBatch]) -> usi
     }
     expected.len()
 }
+
+/// Write JSON lines for stream partition `p` (appending).
+pub fn append_jsonl(dir: &Path, partition: i32, lines: &[String]) {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("{partition}.jsonl")))
+        .unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+}
+
+/// Synthetic click events as JSON lines plus the same rows as a batch (for the reference).
+pub fn clicks(range: std::ops::Range<i64>) -> (Vec<String>, RecordBatch) {
+    let ids: Vec<i64> = range.collect();
+    let lines = ids
+        .iter()
+        .map(|i| format!(r#"{{"id":{i},"cid":{},"user":"u{}","extra":"ignored"}}"#, i % 7, (i * 13) % 41))
+        .collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("cid", DataType::Int64, true),
+        Field::new("user", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
+            Arc::new(Int64Array::from(ids.iter().map(|i| i % 7).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(ids.iter().map(|i| format!("u{}", (i * 13) % 41)).collect::<Vec<_>>())),
+        ],
+    )
+    .unwrap();
+    (lines, batch)
+}
+
+pub fn concat(batches: &[RecordBatch]) -> RecordBatch {
+    datafusion::arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap()
+}
+
+/// Simulate OPTIMIZE on a table: rewrite all files into new ones with `dataChange = false`.
+pub async fn compact(path: &Path) {
+    use deltalake_core::kernel::Action;
+    let mut table = delta::open(&loc(path)).await.unwrap();
+    let ctx = session::new_context(&Default::default()).unwrap();
+    let files = delta::active_files(&table).unwrap();
+    exec::register_delta(&ctx, 0, &table, &files, false).unwrap();
+    let schema = delta::arrow_schema(&table).unwrap();
+    let cols = schema.fields().iter().map(|f| format!("\"{}\"", f.name())).collect::<Vec<_>>().join(", ");
+    let batches = ctx.sql(&format!("SELECT {cols} FROM {}", source_table(0))).await.unwrap().collect().await.unwrap();
+    let mut w = RecordBatchWriter::for_table(&table).unwrap();
+    for b in batches {
+        let b = RecordBatch::try_new(schema.clone(), b.columns().to_vec()).unwrap();
+        w.write(b).await.unwrap();
+    }
+    let mut actions: Vec<Action> = w
+        .flush()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|mut a| {
+            a.data_change = false;
+            Action::Add(a)
+        })
+        .collect();
+    for f in table.snapshot().unwrap().log_data().iter() {
+        actions.push(Action::Remove(f.remove_action(false)));
+    }
+    let op = deltalake_core::protocol::DeltaOperation::Optimize { predicate: None, target_size: 1 << 20 };
+    match delta::commit(&mut table, actions, vec![], op, 3).await.unwrap() {
+        delta::CommitOutcome::Committed(_) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Simulate a DELETE: remove one file with `dataChange = true`.
+pub async fn delete_one_file(path: &Path) {
+    use deltalake_core::kernel::Action;
+    let mut table = delta::open(&loc(path)).await.unwrap();
+    let f = table.snapshot().unwrap().log_data().iter().next().unwrap();
+    let op = deltalake_core::protocol::DeltaOperation::Delete { predicate: Some("test".into()) };
+    match delta::commit(&mut table, vec![Action::Remove(f.remove_action(true))], vec![], op, 3).await.unwrap() {
+        delta::CommitOutcome::Committed(_) => {}
+        other => panic!("{other:?}"),
+    }
+}

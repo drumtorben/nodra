@@ -10,7 +10,7 @@
 //!    step 1. A concurrent commit of the same progress key fails the commit (delta-rs conflict
 //!    check), the batch is abandoned and re-planned.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -99,6 +99,13 @@ impl Pipeline {
         let infos = source_infos(&job).await?;
         let plan = planner::plan_job(&job, &infos).await?;
         let sink_schema = types::delta_schema(&plan.output_schema)?;
+        if matches!(job.sink, crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. })
+            && (job.stream_source().is_some() || plan.class != JobClass::PartitionParallel && plan.class != JobClass::BroadcastJoin)
+        {
+            return Err(NodraError::job(
+                "mode => 'overwrite' is only supported for class-1/2 jobs over Delta sources",
+            ));
+        }
         for p in job.sink.partition_by() {
             if sink_schema.field_with_name(p).is_err() {
                 return Err(NodraError::job(format!(
@@ -107,6 +114,11 @@ impl Pipeline {
             }
         }
         Ok(Pipeline { job, plan, infos, sink_schema })
+    }
+
+    /// True for `mode => 'overwrite'` sinks.
+    pub fn overwrite(&self) -> bool {
+        matches!(self.job.sink, crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. })
     }
 
     /// `nodra plan --explain` text.
@@ -168,9 +180,7 @@ pub async fn run(
     if count == 0 || indices.iter().any(|i| *i >= count) {
         return Err(NodraError::config(format!("invalid worker indices {indices:?} for {count} workers")));
     }
-    if matches!(p.job.sink, crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. })
-        && (count != 1 || !once)
-    {
+    if p.overwrite() && (count != 1 || !once) {
         return Err(NodraError::config("mode => 'overwrite' requires a single worker and --once"));
     }
     if p.plan.class == JobClass::CoPartitionedJoin && !once {
@@ -301,6 +311,10 @@ enum Input {
     Stream(datafusion::arrow::array::RecordBatch),
 }
 
+/// How long a cached target snapshot is used as the read snapshot of the next commit before it
+/// is reloaded (bounds the number of concurrent commits a commit has to check for conflicts).
+const SNAPSHOT_TTL: Duration = Duration::from_secs(300);
+
 struct Worker {
     p: Arc<Pipeline>,
     id: WorkerId,
@@ -310,6 +324,15 @@ struct Worker {
     cursor: Option<i64>,
     /// Partials table schema (class 3), known after the first plan.
     state_schema: Option<SchemaRef>,
+    /// Target snapshot used as the read snapshot of the next commit. After a successful commit
+    /// it is the post-commit snapshot, so the next commit's conflict check covers every commit
+    /// made by others since then (including a zombie replica committing our progress keys).
+    target: Option<DeltaTable>,
+    /// Progress values valid at `target`.
+    known: HashMap<String, Option<i64>>,
+    /// All `txn` versions of `target` when it was loaded (None if not available).
+    all_txns: Option<HashMap<String, i64>>,
+    loaded_at: Option<Instant>,
 }
 
 impl Worker {
@@ -334,27 +357,82 @@ impl Worker {
                 Some((i, src, schema))
             }
         };
-        Ok(Self { p, id, metrics, stream, cursor: None, state_schema: None })
+        Ok(Self {
+            p,
+            id,
+            metrics,
+            stream,
+            cursor: None,
+            state_schema: None,
+            target: None,
+            known: HashMap::new(),
+            all_txns: None,
+            loaded_at: None,
+        })
     }
 
     async fn step(&mut self) -> Result<Step> {
-        let target_loc = self.p.target_location();
-        // The target may not exist before the first batch; it is created when the first
-        // results are written (its schema is only known then for class 3).
-        let target = delta::try_open(&target_loc).await?;
-        if self.p.plan.class == JobClass::CoPartitionedJoin {
-            return self.step_copartitioned(target).await;
+        let target = self.target_snapshot().await?;
+        let res = if self.p.plan.class == JobClass::CoPartitionedJoin {
+            self.step_copartitioned(target).await
+        } else if self.stream.is_some() {
+            self.step_stream(target).await
+        } else {
+            self.step_delta(target).await
+        };
+        if !matches!(res, Ok(Step::Processed { .. }) | Ok(Step::Idle)) {
+            self.invalidate();
         }
-        if self.stream.is_some() {
-            return self.step_stream(target).await;
-        }
-        self.step_delta(target).await
+        res
     }
 
-    async fn progress(&self, target: &Option<DeltaTable>, key: &str) -> Result<Option<i64>> {
-        match target {
-            None => Ok(None),
-            Some(t) => delta::txn_version(t, key).await,
+    /// The target snapshot for this batch: the cached one, or a freshly loaded one. The target
+    /// may not exist before the first batch; it is created when the first results are written
+    /// (for class 3 its schema is only known then).
+    async fn target_snapshot(&mut self) -> Result<Option<DeltaTable>> {
+        let fresh = self.loaded_at.map(|t| t.elapsed() < SNAPSHOT_TTL).unwrap_or(false);
+        if let (Some(t), true) = (&self.target, fresh) {
+            return Ok(Some(t.clone()));
+        }
+        self.invalidate();
+        let t = delta::try_open(&self.p.target_location()).await?;
+        if let Some(t) = &t {
+            self.all_txns = delta::txn_map(t).await?;
+        }
+        self.target = t.clone();
+        self.loaded_at = Some(Instant::now());
+        Ok(t)
+    }
+
+    fn invalidate(&mut self) {
+        self.target = None;
+        self.known.clear();
+        self.all_txns = None;
+        self.loaded_at = None;
+    }
+
+    /// Committed progress for `key` as of the batch's target snapshot.
+    async fn progress(&mut self, target: &Option<DeltaTable>, key: &str) -> Result<Option<i64>> {
+        if let Some(v) = self.known.get(key) {
+            return Ok(*v);
+        }
+        let v = match (target, &self.all_txns) {
+            (None, _) => None,
+            (Some(_), Some(all)) => all.get(key).copied(),
+            (Some(t), None) => delta::txn_version(t, key).await?,
+        };
+        self.known.insert(key.to_string(), v);
+        Ok(v)
+    }
+
+    /// Remember a successful commit: its snapshot becomes the next read snapshot.
+    fn committed(&mut self, table: DeltaTable, progress: &[Progress]) {
+        for pr in progress {
+            self.known.insert(pr.txn.app_id.clone(), Some(pr.txn.version));
+        }
+        self.target = Some(table);
+        if self.loaded_at.is_none() {
+            self.loaded_at = Some(Instant::now());
         }
     }
 
@@ -364,6 +442,9 @@ impl Worker {
         let p = self.p.clone();
         let di = p.plan.driving()[0];
         let SourceSpec::Delta { uri, version: pinned, .. } = &p.job.sources[di] else { unreachable!() };
+        if p.overwrite() {
+            return self.step_overwrite(target, di, uri, *pinned).await;
+        }
         let a_key = p.delta_progress_key(di, self.id.index, self.id.count);
         let b_key = format!("{a_key}/snapshot");
         let committed = self.progress(&target, &a_key).await?;
@@ -465,6 +546,24 @@ impl Worker {
         }
     }
 
+    /// `mode => 'overwrite'`: recompute the sink from the complete current source snapshot in
+    /// one batch (no progress tracking; single worker, `--once`).
+    async fn step_overwrite(&mut self, target: Option<DeltaTable>, di: usize, uri: &str, pinned: Option<i64>) -> Result<Step> {
+        if self.cursor.is_some() {
+            return Ok(Step::Idle);
+        }
+        let src = match pinned {
+            Some(v) => delta::open_version(uri, v).await?,
+            None => delta::open(uri).await?,
+        };
+        self.check_source_schema(di, &src)?;
+        let version = delta::version(&src)? as i64;
+        let files = delta::active_files(&src)?;
+        let step = self.process(target, Input::Files(vec![(di, src, files)]), Vec::new()).await?;
+        self.cursor = Some(version);
+        Ok(step)
+    }
+
     fn owns_file(&self, f: &DataFile) -> bool {
         let key = match &self.p.plan.unit_key {
             UnitKey::Partition(_) => f.partition_key(),
@@ -477,16 +576,34 @@ impl Worker {
     /// worker count exists (files would be assigned differently).
     async fn check_rescale(&self, target: &Option<DeltaTable>, di: usize) -> Result<()> {
         let Some(t) = target else { return Ok(()) };
-        for n in 1..=256u32 {
-            if n == self.id.count {
-                continue;
+        let other = |n: u32| {
+            NodraError::config(format!(
+                "the job was run with {n} workers before; changing the worker count of a \
+                 Delta-driven job is not supported yet (see docs/design.md, Rescaling)"
+            ))
+        };
+        match &self.all_txns {
+            Some(all) => {
+                // Keys look like `<prefix>/w<i>of<n>` (and `<prefix>/w<i>of<n>/snapshot`).
+                let prefix = self.p.delta_progress_key(di, 0, 1);
+                let prefix = prefix.trim_end_matches("w0of1");
+                for k in all.keys() {
+                    if let Some(rest) = k.strip_prefix(prefix) {
+                        let n = rest.split('/').next().and_then(|w| w.split_once("of")).and_then(|(_, n)| n.parse::<u32>().ok());
+                        if let Some(n) = n {
+                            if n != self.id.count {
+                                return Err(other(n));
+                            }
+                        }
+                    }
+                }
             }
-            let key = self.p.delta_progress_key(di, 0, n);
-            if delta::txn_version(t, &key).await?.is_some() {
-                return Err(NodraError::config(format!(
-                    "the job was run with {n} workers before; changing the worker count of a \
-                     Delta-driven job is not supported yet (see docs/design.md, Rescaling)"
-                )));
+            None => {
+                for n in (1..=64u32).filter(|n| *n != self.id.count) {
+                    if delta::txn_version(t, &self.p.delta_progress_key(di, 0, n)).await?.is_some() {
+                        return Err(other(n));
+                    }
+                }
             }
         }
         Ok(())
@@ -647,7 +764,7 @@ impl Worker {
     /// progress for one of our keys. Conflicts caused by concurrent deletes on the target are
     /// retried on a fresh snapshot, after verifying that our progress keys are unchanged.
     async fn commit_checked(
-        &self,
+        &mut self,
         mut target: DeltaTable,
         actions: Vec<Action>,
         progress: &[Progress],
@@ -656,9 +773,15 @@ impl Worker {
         let retries = self.p.job.settings.commit_retries()?;
         let txns: Vec<Transaction> = progress.iter().map(|p| p.txn.clone()).collect();
         for attempt in 0..5 {
-            match delta::commit(&target, actions.clone(), txns.clone(), op.clone(), retries).await? {
-                CommitOutcome::Committed(v) => return Ok(Some(v)),
-                CommitOutcome::Conflict => return Ok(None),
+            match delta::commit(&mut target, actions.clone(), txns.clone(), op.clone(), retries).await? {
+                CommitOutcome::Committed(v) => {
+                    self.committed(target, progress);
+                    return Ok(Some(v));
+                }
+                CommitOutcome::Conflict => {
+                    self.invalidate();
+                    return Ok(None);
+                }
                 CommitOutcome::Retry(why) => {
                     warn!(worker = self.id.index, attempt, "commit conflicts with a concurrent change ({why}); retrying");
                     self.metrics.commit_retries.fetch_add(1, Ordering::Relaxed);

@@ -238,6 +238,100 @@ pub async fn txn_version(t: &DeltaTable, app_id: &str) -> Result<Option<i64>> {
     Ok(t.snapshot()?.transaction_version(t.log_store().as_ref(), app_id).await?)
 }
 
+/// All application-transaction (`txn`) versions of the snapshot `t`, read in one pass over the
+/// latest checkpoint and the commits after it. delta-rs only offers a per-app-id lookup that
+/// replays the log every time, which is too slow for many progress keys.
+///
+/// Returns `None` for checkpoint layouts this reader does not handle (V2 checkpoints); callers
+/// then fall back to [`txn_version`].
+pub async fn txn_map(t: &DeltaTable) -> Result<Option<HashMap<String, i64>>> {
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use datafusion::parquet::arrow::ProjectionMask;
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+
+    let v = version(t)?;
+    let store = t.object_store();
+    let listed: Vec<object_store::ObjectMeta> =
+        store.list(Some(&Path::from("_delta_log"))).try_collect().await?;
+    // version -> (expected parts, files)
+    let mut checkpoints: std::collections::BTreeMap<u64, (usize, Vec<Path>)> = Default::default();
+    for meta in &listed {
+        let Some(name) = meta.location.filename() else { continue };
+        let parts: Vec<&str> = name.split('.').collect();
+        if parts.len() < 3 || parts[1] != "checkpoint" {
+            continue;
+        }
+        let Ok(cv) = parts[0].parse::<u64>() else { continue };
+        if cv > v {
+            continue;
+        }
+        match parts.as_slice() {
+            [_, _, "parquet"] => {
+                checkpoints.entry(cv).or_insert((1, Vec::new())).1.push(meta.location.clone());
+            }
+            [_, _, _part, total, "parquet"] => {
+                let total: usize = total.parse().unwrap_or(0);
+                let e = checkpoints.entry(cv).or_insert((total, Vec::new()));
+                e.1.push(meta.location.clone());
+            }
+            // V2 checkpoint (`<v>.checkpoint.<uuid>.parquet|json`) with sidecars.
+            _ => return Ok(None),
+        }
+    }
+    let mut map = HashMap::new();
+    let complete = checkpoints.into_iter().rev().find(|(_, (n, files))| *n > 0 && files.len() == *n);
+    let start = match complete {
+        Some((cv, (_, files))) => {
+            for path in files {
+                let bytes = store.get(&path).await?.bytes().await?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+                let Some(idx) = builder.schema().fields().iter().position(|f| f.name() == "txn") else {
+                    continue;
+                };
+                let mask = ProjectionMask::roots(builder.parquet_schema(), [idx]);
+                for batch in builder.with_projection(mask).build()? {
+                    let batch = batch?;
+                    let txn = batch.column(0).as_struct();
+                    let (Some(app), Some(ver)) = (txn.column_by_name("appId"), txn.column_by_name("version")) else {
+                        continue;
+                    };
+                    let app = datafusion::arrow::compute::cast(app, &datafusion::arrow::datatypes::DataType::Utf8)?;
+                    let app = app.as_string::<i32>();
+                    let ver = ver.as_primitive::<Int64Type>();
+                    for i in 0..txn.len() {
+                        if txn.is_valid(i) && app.is_valid(i) && ver.is_valid(i) {
+                            map.insert(app.value(i).to_string(), ver.value(i));
+                        }
+                    }
+                }
+            }
+            cv + 1
+        }
+        None => 0,
+    };
+    let log = t.log_store();
+    for cv in start..=v {
+        let bytes = log.read_commit_entry(cv).await?.ok_or_else(|| {
+            NodraError::delta(format!("commit {cv} of {} is missing", t.table_url()))
+        })?;
+        for line in bytes.split(|b| *b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) || !line.windows(6).any(|w| w == b"\"txn\":") {
+                continue;
+            }
+            let val: Value = serde_json::from_slice(line)?;
+            if let Some(txn) = val.get("txn") {
+                if let (Some(app), Some(ver)) = (txn.get("appId").and_then(Value::as_str), txn.get("version").and_then(Value::as_i64)) {
+                    map.insert(app.to_string(), ver);
+                }
+            }
+        }
+    }
+    Ok(Some(map))
+}
+
 /// Changes of commits `(from, to]`, read from the commit files.
 pub async fn changes(t: &DeltaTable, from: u64, to: u64) -> Result<Vec<CommitChanges>> {
     let parts = partition_columns(t)?;
@@ -432,7 +526,7 @@ pub enum CommitOutcome {
 /// log-version race are retried by delta-rs after checking for conflicts; a concurrent commit
 /// of one of our app ids is reported as [`CommitOutcome::Conflict`].
 pub async fn commit(
-    t: &DeltaTable,
+    t: &mut DeltaTable,
     actions: Vec<Action>,
     txns: Vec<Transaction>,
     operation: DeltaOperation,
@@ -451,7 +545,11 @@ pub async fn commit(
         .build(Some(t.snapshot()?), t.log_store(), operation)
         .await;
     match res {
-        Ok(done) => Ok(CommitOutcome::Committed(done.version())),
+        Ok(done) => {
+            let v = done.version();
+            t.state = Some(done.snapshot);
+            Ok(CommitOutcome::Committed(v))
+        }
         Err(DeltaTableError::Transaction { source: TransactionError::CommitConflict(C::ConcurrentTransaction) }) => {
             Ok(CommitOutcome::Conflict)
         }
