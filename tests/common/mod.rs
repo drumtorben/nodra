@@ -114,7 +114,7 @@ pub async fn table_rows(location: &str, columns: &[String]) -> Vec<String> {
     let t = delta::open(location).await.unwrap();
     let ctx = session::new_context(&Default::default()).unwrap();
     let files = delta::active_files(&t).unwrap();
-    exec::register_delta(&ctx, 0, &t, &files, false).unwrap();
+    exec::register_delta(&ctx, 0, &t, None, &files, false).unwrap();
     let cols = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     let batches = ctx.sql(&format!("SELECT {cols} FROM {}", source_table(0))).await.unwrap().collect().await.unwrap();
     render(&batches)
@@ -130,7 +130,7 @@ pub async fn reference(sql: &str, streams: &[RecordBatch]) -> (Vec<String>, Vec<
             SourceSpec::Delta { uri, .. } => {
                 let t = delta::open(uri).await.unwrap();
                 let files = delta::active_files(&t).unwrap();
-                exec::register_delta(&ctx, i, &t, &files, false).unwrap();
+                exec::register_delta(&ctx, i, &t, None, &files, false).unwrap();
             }
             _ => {
                 let b = streams[0].clone();
@@ -245,7 +245,7 @@ pub async fn compact(path: &Path) {
     let mut table = delta::open(&loc(path)).await.unwrap();
     let ctx = session::new_context(&Default::default()).unwrap();
     let files = delta::active_files(&table).unwrap();
-    exec::register_delta(&ctx, 0, &table, &files, false).unwrap();
+    exec::register_delta(&ctx, 0, &table, None, &files, false).unwrap();
     let schema = delta::arrow_schema(&table).unwrap();
     let cols = schema.fields().iter().map(|f| format!("\"{}\"", f.name())).collect::<Vec<_>>().join(", ");
     let batches = ctx.sql(&format!("SELECT {cols} FROM {}", source_table(0))).await.unwrap().collect().await.unwrap();

@@ -60,43 +60,50 @@ pub struct Pipeline {
     pub infos: Vec<SourceInfo>,
     /// Schema written to the sink (Delta-compatible types).
     pub sink_schema: SchemaRef,
+    /// Physical layout of each Delta source (as planned).
+    pub layouts: Vec<Option<delta::Layout>>,
 }
 
-/// Collect what the planner needs to know about each source.
-pub async fn source_infos(job: &Job) -> Result<Vec<SourceInfo>> {
+/// Collect what the planner needs to know about each source, and the layouts of Delta sources.
+pub async fn source_infos(job: &Job) -> Result<(Vec<SourceInfo>, Vec<Option<delta::Layout>>)> {
     let mut infos = Vec::with_capacity(job.sources.len());
+    let mut layouts = Vec::with_capacity(job.sources.len());
     for spec in &job.sources {
-        infos.push(match spec {
+        match spec {
             SourceSpec::Delta { uri, version, .. } => {
                 let t = match version {
                     Some(v) => delta::open_version(uri, *v).await?,
                     None => delta::open(uri).await?,
                 };
                 let files = delta::active_files(&t)?;
-                SourceInfo {
+                infos.push(SourceInfo {
                     schema: delta::exposed_schema(&t)?,
                     partition_columns: delta::partition_columns(&t)?,
                     size_bytes: Some(files.iter().map(|f| f.size).sum()),
                     num_files: Some(files.len()),
                     version: Some(delta::version(&t)? as i64),
-                }
+                });
+                layouts.push(Some(delta::Layout::of(&t)?));
             }
-            SourceSpec::Kafka { schema, .. } | SourceSpec::JsonlStream { schema, .. } => SourceInfo {
-                schema: types::parse_columns(schema).await?,
-                partition_columns: Vec::new(),
-                size_bytes: None,
-                num_files: None,
-                version: None,
-            },
-        });
+            SourceSpec::Kafka { schema, .. } | SourceSpec::JsonlStream { schema, .. } => {
+                infos.push(SourceInfo {
+                    schema: types::parse_columns(schema).await?,
+                    partition_columns: Vec::new(),
+                    size_bytes: None,
+                    num_files: None,
+                    version: None,
+                });
+                layouts.push(None);
+            }
+        }
     }
-    Ok(infos)
+    Ok((infos, layouts))
 }
 
 impl Pipeline {
     /// Inspect the sources and plan the job.
     pub async fn prepare(job: Job) -> Result<Pipeline> {
-        let infos = source_infos(&job).await?;
+        let (infos, layouts) = source_infos(&job).await?;
         let plan = planner::plan_job(&job, &infos).await?;
         let sink_schema = types::delta_schema(&plan.output_schema)?;
         if matches!(job.sink, crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. })
@@ -113,7 +120,7 @@ impl Pipeline {
                 )));
             }
         }
-        Ok(Pipeline { job, plan, infos, sink_schema })
+        Ok(Pipeline { job, plan, infos, sink_schema, layouts })
     }
 
     /// True for `mode => 'overwrite'` sinks.
@@ -222,8 +229,9 @@ pub async fn run(
     if let Some(e) = first_err {
         return Err(e);
     }
-    // With --once, run a last merge after all local workers are done so the sink reflects them.
-    if once && p.plan.class == JobClass::MergeableAggregation && indices.contains(&0) {
+    // With --once and all workers in this process, run a last merge after they are done so the
+    // sink reflects all of them. Distributed --once runs merge with `nodra merge --once`.
+    if once && p.plan.class == JobClass::MergeableAggregation && indices.len() as u32 == count {
         crate::merge::merge(&p).await?;
     }
     Ok(())
@@ -455,13 +463,15 @@ impl Worker {
             (Some(c), Some(k)) if k > c => Some(k),
             (c, _) => c,
         };
-        let src = match pinned {
-            Some(v) => delta::open_version(uri, *v).await?,
-            None => delta::open(uri).await?,
+        // Incremental batches only need the commit files, not a loaded snapshot (which would
+        // replay the whole log of a possibly huge table).
+        let src = delta::handle(uri)?;
+        let latest = match pinned {
+            Some(v) => *v,
+            None => delta::latest_version(&src, progress.unwrap_or(0).max(0) as u64).await? as i64,
         };
-        self.check_source_schema(di, &src)?;
-        let latest = delta::version(&src)? as i64;
         let max_files = p.job.settings.max_files_per_batch()?;
+        let layout = p.layouts[di].clone().expect("delta layout");
         match progress {
             None => {
                 if p.job.settings.start()? == StartPosition::Latest && pinned.is_none() {
@@ -474,7 +484,8 @@ impl Worker {
                     Some(b) => (b >> 24, (b & 0xff_ffff) as usize),
                     None => (latest, 0),
                 };
-                let snap = if snap_version == latest { src } else { delta::open_version(uri, snap_version).await? };
+                let snap = delta::open_version(uri, snap_version).await?;
+                self.check_source_schema(di, &snap)?;
                 let mut files: Vec<DataFile> = delta::active_files(&snap)?
                     .into_iter()
                     .filter(|f| self.owns_file(f))
@@ -497,13 +508,16 @@ impl Worker {
             }
             Some(prog) if prog < latest => {
                 let end = latest.min(prog + 1000);
-                let changes = delta::changes(&src, prog as u64, end as u64).await?;
+                let changes = delta::changes(&src, &layout.partition_columns(), prog as u64, end as u64).await?;
                 let ignore_changes = p.job.settings.ignore_changes()?;
                 let mut files = Vec::new();
                 let mut v_end = prog;
                 for c in changes {
-                    if c.metadata_changed {
-                        self.check_source_schema(di, &src)?;
+                    if c.metadata_changed || c.protocol_changed {
+                        // Schema or protocol change: compare with the planned schema (a restart
+                        // re-plans; until then the new data could not be read correctly).
+                        let at = delta::open_version(uri, c.version as i64).await?;
+                        self.check_source_schema(di, &at)?;
                     }
                     if c.data_removes > 0 && !ignore_changes {
                         return Err(NodraError::delta(format!(
@@ -833,7 +847,7 @@ impl Worker {
                 let driving: BTreeSet<usize> = list.iter().map(|(i, _, _)| *i).collect();
                 for (i, t, files) in list {
                     rows_in += files.iter().filter_map(|f| f.num_records).sum::<u64>();
-                    register_delta(&ctx, i, &t, &files, true)?;
+                    register_delta(&ctx, i, &t, p.layouts[i].as_ref(), &files, true)?;
                 }
                 register_broadcast(&ctx, &p, &driving).await?;
             }
@@ -913,12 +927,23 @@ pub fn store_url(i: usize) -> Result<ObjectStoreUrl> {
     Ok(ObjectStoreUrl::parse(format!("nodra://s{i}"))?)
 }
 
-/// Register Delta source `i` with the given files.
-pub fn register_delta(ctx: &SessionContext, i: usize, t: &DeltaTable, files: &[DataFile], driving: bool) -> Result<()> {
+/// Register Delta source `i` with the given files. `t` may be an unloaded handle; the layout is
+/// taken from `layout`, or from `t`'s snapshot if `None`.
+pub fn register_delta(
+    ctx: &SessionContext,
+    i: usize,
+    t: &DeltaTable,
+    layout: Option<&delta::Layout>,
+    files: &[DataFile],
+    driving: bool,
+) -> Result<()> {
     let url = store_url(i)?;
     ctx.register_object_store(url.as_ref(), t.object_store());
-    let (file_schema, parts) = delta::schemas(t)?;
-    let mut table = FileListTable::try_new(file_schema, parts, url, files)?;
+    let layout = match layout {
+        Some(l) => l.clone(),
+        None => delta::Layout::of(t)?,
+    };
+    let mut table = FileListTable::try_new(layout.file_schema, layout.partition_fields, url, files)?;
     if driving {
         table = table.mark_driving();
     }
@@ -945,7 +970,7 @@ pub async fn register_broadcast(ctx: &SessionContext, p: &Pipeline, skip: &BTree
             )));
         }
         let files = delta::active_files(&t)?;
-        register_delta(ctx, i, &t, &files, false)?;
+        register_delta(ctx, i, &t, None, &files, false)?;
     }
     Ok(())
 }
