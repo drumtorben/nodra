@@ -17,6 +17,7 @@ pub const KNOWN_KEYS: &[(&str, &str, &str)] = &[
     ("nodra.merge_interval", "60s", "How often worker 0 runs the merge step of a class-3 job (0 = after every batch)."),
     ("nodra.partials_location", "<sink>__nodra_partials", "Delta table that stores partial aggregate states."),
     ("nodra.commit_retries", "50", "How often a commit that lost a log-version race is retried."),
+    ("nodra.bad_messages", "fail", "Stream messages that do not match the schema: `fail` the job or `skip` (logged and counted)."),
 ];
 
 /// Parsed settings. Unknown `nodra.*` keys are rejected so typos surface early; other keys
@@ -94,6 +95,16 @@ impl Settings {
     /// `nodra.ignore_changes`.
     pub fn ignore_changes(&self) -> Result<bool> {
         self.boolean("nodra.ignore_changes", false)
+    }
+
+    /// `nodra.bad_messages`: true if malformed stream messages are skipped.
+    pub fn skip_bad_messages(&self) -> Result<bool> {
+        match self.get("nodra.bad_messages").map(|s| s.to_ascii_lowercase()) {
+            None => Ok(false),
+            Some(s) if s == "fail" => Ok(false),
+            Some(s) if s == "skip" => Ok(true),
+            Some(s) => Err(NodraError::config(format!("nodra.bad_messages must be `fail` or `skip`, got `{s}`"))),
+        }
     }
 
     /// `nodra.start`.

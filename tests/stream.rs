@@ -104,4 +104,10 @@ async fn malformed_message_fails_with_context() {
     );
     let err = run_once(&sql, 1).await.unwrap_err().to_string();
     assert!(err.contains("partition 0") && err.contains("message #1"), "{err}");
+    // A value that is valid JSON but not a valid value for the column type.
+    append_jsonl(&stream, 1, &[r#"{"id": 2}"#.to_string(), r#"{"id": "two"}"#.to_string()]);
+    let skip = format!("SET nodra.bad_messages = 'skip'; {sql}");
+    run_once(&skip, 1).await.unwrap();
+    let ids = table_rows(&loc(&out), &["id".to_string()]).await;
+    assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);
 }
