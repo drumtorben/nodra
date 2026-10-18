@@ -45,7 +45,7 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let Some(partials) = delta::try_open(&partials_location(&p.job)).await? else {
         return Ok(MergeOutcome::UpToDate);
     };
-    let sink = delta::create_or_open(p.job.sink.uri(), &p.sink_schema, p.job.sink.partition_by()).await?;
+    let mut sink = delta::create_or_open(p.job.sink.uri(), &p.sink_schema, p.job.sink.partition_by()).await?;
     let key = p.merge_progress_key();
     let merged = delta::txn_version(&sink, &key).await?;
     let latest = delta::version(&partials)? as i64;
@@ -100,7 +100,7 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let predicate = scoped.as_ref().map(|s| format!("nodra merge of {} partition(s)", s.len()));
     let op = delta::overwrite_op(&sink_parts, predicate);
     let retries = p.job.settings.commit_retries()?;
-    match delta::commit(&sink, actions, vec![Transaction::new(&key, latest)], op, retries).await? {
+    match delta::commit(&mut sink, actions, vec![Transaction::new(&key, latest)], op, retries).await? {
         CommitOutcome::Committed(v) => {
             info!(
                 sink_version = v,
