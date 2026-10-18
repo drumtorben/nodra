@@ -612,7 +612,7 @@ pub fn explain(job: &Job, infos: &[SourceInfo], plan: &JobPlan) -> String {
             (Role::Broadcast, _) => "broadcast · loaded by every worker".to_string(),
         };
         let size = match (info.size_bytes, info.num_files) {
-            (Some(b), Some(n)) => format!(" ({}, {n} files)", human_bytes(b)),
+            (Some(b), Some(n)) => format!(" ({}, {n} file{})", human_bytes(b), if n == 1 { "" } else { "s" }),
             _ => String::new(),
         };
         let _ = writeln!(s, "  {}  {}{size}\n      {role}", source_table(i), spec.describe());
@@ -625,8 +625,14 @@ pub fn explain(job: &Job, infos: &[SourceInfo], plan: &JobPlan) -> String {
         if parts.is_empty() { String::new() } else { format!(" partitioned by [{}]", parts.join(", ")) }
     );
     let _ = writeln!(s, "output:");
+    let width = plan.output_schema.fields().iter().map(|f| f.name().len()).max().unwrap_or(0);
     for f in plan.output_schema.fields() {
-        let _ = writeln!(s, "  {} {}", f.name(), display_type(f.data_type()));
+        let stored = match crate::types::delta_type(f.data_type()) {
+            Ok(t) if &t != f.data_type() => format!("  (stored as {})", display_type(&t)),
+            Ok(_) => String::new(),
+            Err(e) => format!("  ({e})"),
+        };
+        let _ = writeln!(s, "  {:width$}  {}{stored}", f.name(), display_type(f.data_type()));
     }
     if let Some(scope) = &plan.merge_scope {
         let _ = writeln!(

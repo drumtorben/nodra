@@ -10,15 +10,40 @@ use nodra::{merge, status, NodraError, Result};
 use tokio::sync::watch;
 use tracing::{error, info, Level};
 
+/// Logging: `RUST_LOG` sets Nodra's level (`error|warn|info|debug|trace`, default `info`);
+/// libraries log at `warn` unless `RUST_LOG=debug,all` / `trace,all` is given.
 fn init_logging() {
-    let level = match std::env::var("RUST_LOG").unwrap_or_default().to_ascii_lowercase().as_str() {
+    use std::io::IsTerminal;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::prelude::*;
+    let spec = std::env::var("RUST_LOG").unwrap_or_default().to_ascii_lowercase();
+    let mut parts = spec.split(',').map(str::trim);
+    let level = match parts.next().unwrap_or("") {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
         "warn" => Level::WARN,
         "error" => Level::ERROR,
         _ => Level::INFO,
     };
-    tracing_subscriber::fmt().with_max_level(level).with_target(false).init();
+    let libs = if parts.any(|p| p == "all") { level } else { Level::WARN.min(level) };
+    // delta-rs warns about every commit that had to be retried after a concurrent commit, which
+    // is the normal case for Nodra's workers.
+    // Same for statistics skipped on binary columns (partial aggregate states).
+    let quiet = if libs > Level::WARN { libs } else { Level::ERROR };
+    let filter = Targets::new()
+        .with_target("nodra", level)
+        .with_target("deltalake_core::kernel::transaction", quiet)
+        .with_target("deltalake_core::writer::stats", quiet)
+        .with_default(libs);
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal()),
+        )
+        .with(filter)
+        .init();
 }
 
 #[tokio::main]

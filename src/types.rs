@@ -49,7 +49,7 @@ pub async fn parse_columns(ddl: &str) -> Result<SchemaRef> {
 /// Map an Arrow type to the type Nodra writes to Delta.
 ///
 /// Delta has no unsigned integers, string/binary views, nanosecond timestamps or dictionaries,
-/// so those are widened or unwrapped. Timestamps are written as Delta `timestamp`
+/// so those are widened or unwrapped (`UINT64` becomes `BIGINT`; larger values fail the cast). Timestamps are written as Delta `timestamp`
 /// (microseconds, UTC); timestamps without a time zone are interpreted as UTC.
 pub fn delta_type(dt: &DataType) -> Result<DataType> {
     Ok(match dt {
@@ -67,7 +67,8 @@ pub fn delta_type(dt: &DataType) -> Result<DataType> {
         DataType::UInt8 => DataType::Int16,
         DataType::UInt16 => DataType::Int32,
         DataType::UInt32 => DataType::Int64,
-        DataType::UInt64 => DataType::Decimal128(20, 0),
+        // Counts such as approx_distinct are UInt64; values above i64::MAX fail the cast loudly.
+        DataType::UInt64 => DataType::Int64,
         DataType::Float16 => DataType::Float32,
         DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
         DataType::BinaryView | DataType::LargeBinary | DataType::FixedSizeBinary(_) => DataType::Binary,

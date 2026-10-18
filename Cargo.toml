@@ -2,7 +2,7 @@
 name = "nodra"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Driverless, shuffle-free pipeline engine on DataFusion and Delta Lake"
 license = "Apache-2.0"
 

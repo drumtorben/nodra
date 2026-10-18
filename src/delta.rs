@@ -179,6 +179,13 @@ pub async fn open_version(location: &str, version: i64) -> Result<DeltaTable> {
 
 /// Open a table, or `None` if there is no table at `location` yet.
 pub async fn try_open(location: &str) -> Result<Option<DeltaTable>> {
+    use futures::StreamExt;
+    // Check for a log first: loading a missing table makes delta-rs log an error.
+    let probe = handle(location)?;
+    let mut listing = probe.object_store().list(Some(&Path::from("_delta_log")));
+    if listing.next().await.transpose()?.is_none() {
+        return Ok(None);
+    }
     match builder(location)?.load().await {
         Ok(t) => Ok(Some(t)),
         Err(DeltaTableError::NotATable(_)) => Ok(None),

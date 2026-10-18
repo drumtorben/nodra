@@ -32,6 +32,8 @@ pub struct WorkerMetrics {
     pub lag: AtomicU64,
     /// Unix time (seconds) of the last successful commit.
     pub last_commit_unix: AtomicU64,
+    /// Stream messages skipped because they did not match the schema.
+    pub bad_messages: AtomicU64,
 }
 
 type Registry = Mutex<BTreeMap<(String, u32), Arc<WorkerMetrics>>>;
@@ -55,7 +57,7 @@ pub fn worker(job: &str, worker: u32) -> Arc<WorkerMetrics> {
 pub fn render() -> String {
     let reg = registry().lock().expect("metrics registry poisoned");
     let mut out = String::new();
-    let series: [(&str, &str, &str, fn(&WorkerMetrics) -> u64); 9] = [
+    let series: [(&str, &str, &str, fn(&WorkerMetrics) -> u64); 10] = [
         ("nodra_batches_total", "counter", "Batches committed.", |m| m.batches.load(Ordering::Relaxed)),
         ("nodra_rows_in_total", "counter", "Input rows read.", |m| m.rows_in.load(Ordering::Relaxed)),
         ("nodra_rows_out_total", "counter", "Rows written.", |m| m.rows_out.load(Ordering::Relaxed)),
@@ -65,6 +67,7 @@ pub fn render() -> String {
         ("nodra_last_batch_milliseconds", "gauge", "Duration of the last batch.", |m| m.last_batch_ms.load(Ordering::Relaxed)),
         ("nodra_lag", "gauge", "Unprocessed input (records for streams, versions for Delta).", |m| m.lag.load(Ordering::Relaxed)),
         ("nodra_last_commit_timestamp_seconds", "gauge", "Unix time of the last commit.", |m| m.last_commit_unix.load(Ordering::Relaxed)),
+        ("nodra_bad_messages_total", "counter", "Stream messages skipped (nodra.bad_messages = 'skip').", |m| m.bad_messages.load(Ordering::Relaxed)),
     ];
     for (name, kind, help, get) in series {
         let _ = writeln!(out, "# HELP {name} {help}");

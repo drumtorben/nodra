@@ -38,7 +38,7 @@ use crate::session;
 use crate::settings::StartPosition;
 use crate::sink;
 use crate::source::jsonl::JsonlStream;
-use crate::source::stream::{decode_json, StreamRef};
+use crate::source::stream::{decode_json, decode_json_lenient, StreamRef};
 use crate::types;
 
 /// Location of the partial-state table of a class-3 job.
@@ -641,6 +641,7 @@ impl Worker {
         let (si, src, schema) = self.stream.clone().expect("stream source");
         let start = self.p.job.settings.start()?;
         let max = self.p.job.settings.max_records_per_partition()?;
+        let skip_bad = self.p.job.settings.skip_bad_messages()?;
         let parts: Vec<i32> = src
             .partitions()
             .await?
@@ -679,7 +680,16 @@ impl Worker {
             let fetched = src.fetch(part, from, high, max).await?;
             if fetched.next_offset > from {
                 let ctx = format!("{} partition {part} offsets {from}..{}", self.p.job.sources[si].describe(), fetched.next_offset);
-                batches.push(decode_json(&schema, &fetched.payloads, &ctx)?);
+                if skip_bad {
+                    let (batch, bad) = decode_json_lenient(&schema, &fetched.payloads)?;
+                    for (i, e) in bad.iter().take(3) {
+                        warn!(partition = part, "skipping message #{i} of {ctx}: {e}");
+                    }
+                    self.metrics.bad_messages.fetch_add(bad.len() as u64, Ordering::Relaxed);
+                    batches.push(batch);
+                } else {
+                    batches.push(decode_json(&schema, &fetched.payloads, &ctx)?);
+                }
                 txns.retain(|t: &Progress| t.txn.app_id != key);
                 txns.push(Progress::new(&key, fetched.next_offset, committed));
             }
