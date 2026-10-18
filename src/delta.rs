@@ -126,6 +126,39 @@ mod azure {
     }
 }
 
+/// A handle to a table without loading its snapshot: enough to read commits, find the latest
+/// version and access its object store.
+pub fn handle(location: &str) -> Result<DeltaTable> {
+    Ok(builder(location)?.build()?)
+}
+
+/// Latest version of the table behind `handle`, listing the log from `hint` onwards.
+pub async fn latest_version(handle: &DeltaTable, hint: u64) -> Result<u64> {
+    Ok(handle.log_store().get_latest_version(hint).await?)
+}
+
+/// Physical layout of a table: the schema of its data files and its partition columns.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    /// Columns stored in the Parquet files.
+    pub file_schema: SchemaRef,
+    /// Partition columns (not stored in the files), in table order.
+    pub partition_fields: Vec<FieldRef>,
+}
+
+impl Layout {
+    /// Layout of a loaded table.
+    pub fn of(t: &DeltaTable) -> Result<Layout> {
+        let (file_schema, partition_fields) = schemas(t)?;
+        Ok(Layout { file_schema, partition_fields })
+    }
+
+    /// Partition column names.
+    pub fn partition_columns(&self) -> Vec<String> {
+        self.partition_fields.iter().map(|f| f.name().clone()).collect()
+    }
+}
+
 /// Open the latest version of a table.
 pub async fn open(location: &str) -> Result<DeltaTable> {
     let t = builder(location)?.load().await.map_err(|e| match e {
@@ -332,9 +365,9 @@ pub async fn txn_map(t: &DeltaTable) -> Result<Option<HashMap<String, i64>>> {
     Ok(Some(map))
 }
 
-/// Changes of commits `(from, to]`, read from the commit files.
-pub async fn changes(t: &DeltaTable, from: u64, to: u64) -> Result<Vec<CommitChanges>> {
-    let parts = partition_columns(t)?;
+/// Changes of commits `(from, to]`, read from the commit files. `t` may be an unloaded handle.
+pub async fn changes(t: &DeltaTable, partition_cols: &[String], from: u64, to: u64) -> Result<Vec<CommitChanges>> {
+    let parts = partition_cols.to_vec();
     let store = t.log_store();
     let mut out = Vec::new();
     for v in (from + 1)..=to {

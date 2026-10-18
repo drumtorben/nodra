@@ -58,7 +58,7 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     // Which partial files to read and which sink files to replace.
     let scoped: Option<HashSet<Vec<Option<String>>>> = match (&p.plan.merge_scope, merged) {
         (Some(MergeScope::Partitions(_)), Some(m)) if m < latest => {
-            match delta::changes(&partials, m as u64, latest as u64).await {
+            match delta::changes(&partials, &delta::partition_columns(&partials)?, m as u64, latest as u64).await {
                 Ok(changes) => Some(
                     changes
                         .into_iter()
@@ -88,8 +88,8 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let physical = ctx.sql(&p.job.query).await?.create_physical_plan().await?;
     let url = datafusion::execution::object_store::ObjectStoreUrl::parse("nodra://partials")?;
     ctx.register_object_store(url.as_ref(), partials.object_store());
-    let (file_schema, part_fields) = delta::schemas(&partials)?;
-    let states = FileListTable::try_new(file_schema, part_fields, url, &files)?;
+    let layout = delta::Layout::of(&partials)?;
+    let states = FileListTable::try_new(layout.file_schema, layout.partition_fields, url, &files)?;
     let states_plan = states.scan(&ctx.state(), None, &[], None).await?;
     let plan = partial::merge_plan(&physical, states_plan)?;
     let stream = execute_stream(plan, ctx.task_ctx())?;
