@@ -205,6 +205,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn job_reference_lists_every_setting() {
+        let doc = include_str!("../docs/jobs.md");
+        for (key, default, _) in KNOWN_KEYS {
+            let row = doc.lines().find(|l| l.starts_with(&format!("| `{key}` |")));
+            let row = row.unwrap_or_else(|| panic!("docs/jobs.md has no row for {key}"));
+            assert!(row.contains(default), "docs/jobs.md: wrong default for {key}: {row}");
+        }
+    }
+
+    #[test]
     fn durations() {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));

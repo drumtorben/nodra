@@ -126,6 +126,28 @@ pub fn validate_column_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Like [`cast_batch`], but matches columns by name: `target` may order them differently (an
+/// existing table created by an earlier version of the query).
+pub fn cast_batch_by_name(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    if schema.fields().iter().map(|f| f.name()).eq(target.fields().iter().map(|f| f.name())) {
+        return cast_batch(batch, target);
+    }
+    let columns = target
+        .fields()
+        .iter()
+        .map(|f| {
+            schema
+                .index_of(f.name())
+                .map(|i| batch.column(i).clone())
+                .map_err(|_| NodraError::job(format!("the query result has no column `{}`", f.name())))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fields: Vec<_> = target.fields().iter().map(|f| schema.field_with_name(f.name()).cloned()).collect::<std::result::Result<_, _>>()?;
+    let reordered = RecordBatch::try_new(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?;
+    cast_batch(&reordered, target)
+}
+
 /// Cast `batch` to `target` (same column order and count).
 pub fn cast_batch(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
     if batch.schema().fields().len() != target.fields().len() {

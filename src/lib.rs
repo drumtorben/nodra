@@ -13,6 +13,7 @@ pub mod merge;
 pub mod metrics;
 pub mod partial;
 pub mod planner;
+pub mod rescale;
 pub mod scan;
 pub mod session;
 pub mod settings;

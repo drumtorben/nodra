@@ -1,4 +1,4 @@
-//! Failure handling: crashes, zombie workers, rescaling, source changes.
+//! Failure handling: crashes, zombie workers, source changes (rescaling: `tests/rescale.rs`).
 mod common;
 
 use std::sync::Arc;
@@ -63,25 +63,13 @@ async fn zombie_replicas_of_a_worker_never_duplicate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn changing_worker_count_of_delta_job_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let (src, out) = (dir.path().join("events"), dir.path().join("out"));
-    events_table(&src, 2, 10).await;
-    let sql = format!("INSERT INTO delta('{}') SELECT id FROM delta('{}')", loc(&out), loc(&src));
-    run_once(&sql, 2).await.unwrap();
-    let err = run_once(&sql, 3).await.unwrap_err().to_string();
-    assert!(err.contains("worker count"), "{err}");
-    run_once(&sql, 2).await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compaction_in_source_is_not_reprocessed() {
     let dir = tempfile::tempdir().unwrap();
     let (src, out) = (dir.path().join("events"), dir.path().join("out"));
     events_table(&src, 3, 20).await;
     let sql = format!("INSERT INTO delta('{}') SELECT id, v FROM delta('{}')", loc(&out), loc(&src));
     run_once(&sql, 2).await.unwrap();
-    compact(&src).await;
+    assert!(compact(&src).await);
     append(&src, events(60..70)).await;
     run_once(&sql, 2).await.unwrap();
     assert_eq!(assert_matches_reference(&sql, &[]).await, 70);

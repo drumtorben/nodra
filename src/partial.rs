@@ -18,7 +18,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 
 use crate::error::{NodraError, Result};
 
@@ -109,17 +110,37 @@ pub fn merge_plan(
         _ => worker_plan(plan)?.schema(),
     };
     let restored = restore_states(states, &partial_schema)?;
-    let replacement: Arc<dyn ExecutionPlan> = match agg.mode() {
-        AggregateMode::Partial => restored,
-        _ => Arc::new(AggregateExec::try_new(
-            AggregateMode::Final,
+    // The operators above the split were planned for the split's output partitioning (often a
+    // single partition, because the merge is planned over an empty placeholder). The state scan
+    // can have any number of partitions, so reproduce that partitioning: either one partition,
+    // or a hash partitioning on the group columns (which keeps every group in one partition).
+    let partitions = split.output_partitioning().partition_count();
+    let group_columns = agg.group_expr().num_group_exprs();
+    let fit = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+        if partitions <= 1 || group_columns == 0 {
+            return Ok(coalesce(input));
+        }
+        let keys: Vec<Arc<dyn PhysicalExpr>> = (0..group_columns)
+            .map(|i| Arc::new(Column::new(partial_schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>)
+            .collect();
+        Ok(Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(keys, partitions))?))
+    };
+    let final_agg = |mode: AggregateMode, input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(AggregateExec::try_new(
+            mode,
             agg.group_expr().as_final(),
             agg.aggr_expr().to_vec(),
             agg.filter_expr().to_vec(),
-            Arc::new(CoalescePartitionsExec::new(restored)),
+            input,
             agg.input_schema(),
-        )?),
+        )?))
     };
+    let replacement: Arc<dyn ExecutionPlan> = match agg.mode() {
+        AggregateMode::Partial => fit(restored)?,
+        AggregateMode::SinglePartitioned => final_agg(AggregateMode::FinalPartitioned, fit(restored)?)?,
+        _ => final_agg(AggregateMode::Final, coalesce(restored))?,
+    };
+    let replacement = rename_like(replacement, &split.schema())?;
     let target = Arc::as_ptr(&split) as *const () as usize;
     let rewritten = plan.clone().transform_down(|node| {
         if Arc::as_ptr(&node) as *const () as usize == target {
@@ -132,6 +153,39 @@ pub fn merge_plan(
         return Err(NodraError::job("internal: failed to replace the split aggregate"));
     }
     Ok(rewritten.data)
+}
+
+fn coalesce(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    if input.output_partitioning().partition_count() == 1 {
+        input
+    } else {
+        Arc::new(CoalescePartitionsExec::new(input))
+    }
+}
+
+/// Give `plan`'s columns the names of `like` (same types, same order). Optimizers may have
+/// rewritten the split aggregate's expressions (e.g. `first_value(x ORDER BY y DESC)` into
+/// `last_value(x ORDER BY y)`), and the operators above refer to the original names.
+fn rename_like(plan: Arc<dyn ExecutionPlan>, like: &SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
+    let have = plan.schema();
+    if have.fields().len() != like.fields().len()
+        || have.fields().iter().zip(like.fields()).any(|(a, b)| a.data_type() != b.data_type())
+    {
+        return Err(NodraError::job(format!(
+            "internal: merge plan produces {have:?} where the query expects {like:?}"
+        )));
+    }
+    if have.fields().iter().zip(like.fields()).all(|(a, b)| a.name() == b.name()) {
+        return Ok(plan);
+    }
+    let exprs = have
+        .fields()
+        .iter()
+        .zip(like.fields())
+        .enumerate()
+        .map(|(i, (a, b))| (Arc::new(Column::new(a.name(), i)) as Arc<dyn PhysicalExpr>, b.name().clone()))
+        .collect::<Vec<_>>();
+    Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
 }
 
 /// Project `states` (columns `s0..sN`) to the partial schema: order, types and names.

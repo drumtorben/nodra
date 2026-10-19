@@ -352,8 +352,17 @@ pub async fn txn_map(t: &DeltaTable) -> Result<Option<HashMap<String, i64>>> {
         }
         None => 0,
     };
+    if start <= v {
+        map.extend(txns_in_commits(t, start, v).await?);
+    }
+    Ok(Some(map))
+}
+
+/// The `txn` versions set by commits `from..=to` (later commits win).
+pub async fn txns_in_commits(t: &DeltaTable, from: u64, to: u64) -> Result<HashMap<String, i64>> {
     let log = t.log_store();
-    for cv in start..=v {
+    let mut map = HashMap::new();
+    for cv in from..=to {
         let bytes = log.read_commit_entry(cv).await?.ok_or_else(|| {
             NodraError::delta(format!("commit {cv} of {} is missing", t.table_url()))
         })?;
@@ -369,7 +378,7 @@ pub async fn txn_map(t: &DeltaTable) -> Result<Option<HashMap<String, i64>>> {
             }
         }
     }
-    Ok(Some(map))
+    Ok(map)
 }
 
 /// Changes of commits `(from, to]`, read from the commit files. `t` may be an unloaded handle.
@@ -560,6 +569,9 @@ pub enum CommitOutcome {
     /// A concurrent commit (e.g. a DELETE on the target) conflicts with our read snapshot; the
     /// same actions can be retried on a fresh snapshot after re-checking progress.
     Retry(String),
+    /// `max_retries = 0` and the table moved on since the read snapshot: actions derived from
+    /// the snapshot (such as `remove`s) must be recomputed on a fresh one.
+    Stale,
 }
 
 /// Commit `actions` and `txns` on top of the snapshot `t` was loaded at. Commits that lose a
@@ -597,6 +609,9 @@ pub async fn commit(
             if matches!(c, C::ConcurrentDeleteRead | C::ConcurrentDeleteDelete) =>
         {
             Ok(CommitOutcome::Retry(c.to_string()))
+        }
+        Err(DeltaTableError::Transaction { source: TransactionError::MaxCommitAttempts(_) }) if max_retries == 0 => {
+            Ok(CommitOutcome::Stale)
         }
         Err(e) => Err(e.into()),
     }

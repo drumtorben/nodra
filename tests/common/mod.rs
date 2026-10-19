@@ -239,8 +239,9 @@ pub fn concat(batches: &[RecordBatch]) -> RecordBatch {
     datafusion::arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap()
 }
 
-/// Simulate OPTIMIZE on a table: rewrite all files into new ones with `dataChange = false`.
-pub async fn compact(path: &Path) {
+/// Simulate OPTIMIZE: rewrite all files into one (`dataChange = false`). Returns false if a
+/// concurrent commit made the compaction conflict (it then commits nothing).
+pub async fn compact(path: &Path) -> bool {
     use deltalake_core::kernel::Action;
     let mut table = delta::open(&loc(path)).await.unwrap();
     let ctx = session::new_context(&Default::default()).unwrap();
@@ -269,7 +270,9 @@ pub async fn compact(path: &Path) {
     }
     let op = deltalake_core::protocol::DeltaOperation::Optimize { predicate: None, target_size: 1 << 20 };
     match delta::commit(&mut table, actions, vec![], op, 3).await.unwrap() {
-        delta::CommitOutcome::Committed(_) => {}
+        delta::CommitOutcome::Committed(_) => true,
+        // A concurrent commit removed files this compaction rewrites: it must not commit.
+        delta::CommitOutcome::Retry(_) | delta::CommitOutcome::Conflict => false,
         other => panic!("{other:?}"),
     }
 }
