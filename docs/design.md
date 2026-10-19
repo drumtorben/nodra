@@ -39,8 +39,10 @@ run without moving rows between workers.
 **Driving source.** The source that is split across workers: the stream source if there is one
 (at most one), otherwise the largest Delta table that can be split — not one marked
 `broadcast => true`, not one on the non-preserved side of an outer, semi or anti join, and not
-one read only in a subquery. Once a job has run, the driving source is the one with progress in
-the target table, even if another table has grown larger since. Every other Delta table must be
+one read only in a subquery. Once a job has run, the driving source — and the class — stay what
+the progress keys in the target show, even if another table has grown larger since: a broadcast
+table that outgrows `nodra.broadcast_threshold` stops the job with a hint instead of silently
+turning it into a class-4 job that would process everything again. Every other Delta table must be
 *broadcastable* (size ≤ `nodra.broadcast_threshold`, default 1 GiB) or co-partitioned with the
 driving table.
 
@@ -90,6 +92,8 @@ Progress keys (`txn.appId`):
 | --- | --- | --- |
 | Delta, incremental | `nodra/<job>/<source>/w<i>of<n>` (generation 0), `…/g<g>/w<i>of<n>` | last fully processed source table version |
 | Delta, initial snapshot | `<worker key>/snapshot` | snapshot version and number of files done |
+| Delta, job start | `nodra/<job>/<source>/start` | source version all first-generation workers start from |
+| Stream, job start (`start = latest`) | `nodra/<job>/<source>/start/p<partition>` | high watermark of the partition when the job started |
 | Stream partition | `nodra/<job>/<source>/p<partition>` | next offset to read |
 | Class 4 partition | `nodra/<job>/part/<fnv(partition)>` | fingerprint of the partition's files |
 | Merge | `nodra/<job>/merge` | partials table version merged |
@@ -119,13 +123,19 @@ rewrites) are skipped. `remove` actions with `dataChange = true` (deletes/update
 unless `nodra.ignore_changes = true`, matching Spark's streaming semantics. If the needed commit
 files were already cleaned up, the worker stops with an error instead of guessing.
 
-**Initial snapshot.** Without progress, a worker processes the source's current snapshot in
-chunks of `nodra.max_files_per_batch` files; the snapshot key records the snapshot version and
-the number of files done, so a resumed run continues with the next file even if the chunk size
-changed.
+**Initial snapshot.** Without progress, a worker processes the source's snapshot in chunks of
+`nodra.max_files_per_batch` files. All workers use the same snapshot version: the first worker
+to commit records it (`…/start`), and workers that start later use it too — snapshots at
+different versions would lose or repeat rows around a compaction committed in between. The
+snapshot key records the snapshot version and the number of files done (so a resumed run
+continues with the next file even if the chunk size changed) and is written by every snapshot
+commit, so two replicas of a worker conflict even if they chunk differently.
 
-**Streams.** `nodra.start = 'latest'` starts at the high watermark when none of the worker's
-partitions has progress yet; partitions that appear later start at their earliest offset.
+**Streams.** With `nodra.start = 'latest'`, the first worker to commit records the high
+watermark of every partition (`…/start/p<k>`). A partition without progress starts at its
+recorded offset; a partition without a record appeared after the start and is read from its
+earliest offset. Workers that start late therefore skip nothing that arrived after the job
+started.
 
 ## 5. Rescaling
 
@@ -164,6 +174,11 @@ Nodra uses DataFusion's two-phase aggregation:
   unpartitioned sink is recomputed fully.
 * Every DataFusion aggregate with mergeable state works: `count`, `sum`, `avg`, `min`, `max`,
   `approx_distinct` (HyperLogLog), `count(DISTINCT …)`, statistical aggregates, …
+* **Canonical layout.** Physical optimizers may order the group keys differently on workers and
+  in the merge step (they see different statistics). Partial states are therefore stored with
+  the group columns in the order of the *logical* aggregate, identified by name, and both sides
+  map their physical layout onto it. Uncorrelated scalar subqueries are planned as joins, so the
+  worker plan is a self-contained part of the full plan; `nodra plan` builds both plans.
 
 The merge commit carries `nodra/<job>/merge = <partials version>`, so merging is idempotent.
 

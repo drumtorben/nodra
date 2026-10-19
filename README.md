@@ -111,6 +111,20 @@ Class 3 works for every DataFusion aggregate with mergeable state: `count`, `sum
 
 Details: [docs/design.md](docs/design.md).
 
+## Performance
+
+A first measurement with `cargo run --release --example bench` (8 million events, 16 Delta
+commits, 4 day partitions, a 1 000-row dimension table, 2 local workers on a 2-vCPU cloud VM
+that was busy with other work at the same time):
+
+| Job | Time | Throughput |
+| --- | --- | --- |
+| class 2: enrich every event with the dimension, write a partitioned Delta table | 4.5 s | 1.8 M rows/s |
+| class 3: daily counts, sums and `approx_distinct` per brand (partials + merge) | 2.4 s | 3.3 M rows/s |
+
+Each worker is DataFusion on its own slice, so throughput scales with workers until storage
+bandwidth is the limit. Treat these numbers as an order of magnitude, not a benchmark.
+
 ## Documentation
 
 * [docs/jobs.md](docs/jobs.md) — job file reference: sources, sinks, settings
