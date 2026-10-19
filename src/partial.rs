@@ -7,6 +7,11 @@
 //! * workers run it in `Partial` mode and persist its output (accumulator states),
 //! * the merge step replaces it with a `Final` aggregate over a scan of those states and runs
 //!   the rest of the plan on top.
+//!
+//! The persisted layout is canonical: group columns in the order of the *logical* aggregate
+//! (identified by name), then the accumulator states. Physical optimizers may reorder the group
+//! keys differently on workers and in the merge step (for example to match a join above the
+//! aggregate), so both sides map their plan's layout to the canonical one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,26 +65,65 @@ fn find_split(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     walk(plan).1
 }
 
-/// The plan a worker runs for a class-3 job: the split aggregate in `Partial` mode.
-pub fn worker_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+/// The plan a worker runs for a class-3 job: the split aggregate in `Partial` mode, with its
+/// output in the canonical layout. `group_names` are the logical aggregate's group columns.
+pub fn worker_plan(plan: &Arc<dyn ExecutionPlan>, group_names: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
     let split = find_split(plan).ok_or_else(|| {
         NodraError::job("internal: no aggregate over the driving source found in the physical plan")
     })?;
     let agg = split.downcast_ref::<AggregateExec>().expect("aggregate");
-    match agg.mode() {
-        AggregateMode::Partial => Ok(split.clone()),
-        AggregateMode::Single | AggregateMode::SinglePartitioned => Ok(Arc::new(AggregateExec::try_new(
+    let partial: Arc<dyn ExecutionPlan> = match agg.mode() {
+        AggregateMode::Partial => split.clone(),
+        AggregateMode::Single | AggregateMode::SinglePartitioned => Arc::new(AggregateExec::try_new(
             AggregateMode::Partial,
             agg.group_expr().clone(),
             agg.aggr_expr().to_vec(),
             agg.filter_expr().to_vec(),
             agg.input().clone(),
             agg.input_schema(),
-        )?)),
-        other => Err(NodraError::job(format!(
-            "internal: unexpected aggregate mode {other:?} next to the driving source"
-        ))),
+        )?),
+        other => {
+            return Err(NodraError::job(format!(
+                "internal: unexpected aggregate mode {other:?} next to the driving source"
+            )))
+        }
+    };
+    let order = canonical_order(&partial.schema(), agg.group_expr().num_group_exprs(), group_names)?;
+    if order.iter().enumerate().all(|(i, j)| i == *j) {
+        return Ok(partial);
     }
+    let schema = partial.schema();
+    let exprs = order
+        .iter()
+        .map(|&j| (Arc::new(Column::new(schema.field(j).name(), j)) as Arc<dyn PhysicalExpr>, schema.field(j).name().clone()))
+        .collect::<Vec<_>>();
+    Ok(Arc::new(ProjectionExec::try_new(exprs, partial)?))
+}
+
+/// Indices of `partial`'s fields in canonical order: the first `group_columns` fields reordered
+/// like `group_names`, then the remaining (state) fields unchanged.
+pub fn canonical_order(partial: &SchemaRef, group_columns: usize, group_names: &[String]) -> Result<Vec<usize>> {
+    let names: Vec<&String> = partial.fields().iter().take(group_columns).map(|f| f.name()).collect();
+    if group_names.len() != group_columns {
+        return Err(NodraError::job(format!(
+            "internal: the aggregate has {group_columns} group columns in the physical plan, {} in the logical plan",
+            group_names.len()
+        )));
+    }
+    let mut order = Vec::with_capacity(partial.fields().len());
+    for wanted in group_names {
+        let mut hits = names.iter().enumerate().filter(|(_, n)| **n == wanted);
+        match (hits.next(), hits.next()) {
+            (Some((j, _)), None) => order.push(j),
+            _ => {
+                return Err(NodraError::job(format!(
+                    "internal: group column `{wanted}` not found once among the physical group columns {names:?}"
+                )))
+            }
+        }
+    }
+    order.extend(group_columns..partial.fields().len());
+    Ok(order)
 }
 
 /// Positional names for partial-state columns (`s0`, `s1`, …): DataFusion's state field names
@@ -95,21 +139,33 @@ pub fn state_schema(partial: &SchemaRef) -> SchemaRef {
 }
 
 /// The plan of the merge step: `plan` with the split aggregate replaced by a `Final` aggregate
-/// over `states`. `states` must produce columns named `s0..sN` (any order, any types castable to
-/// the partial schema); they are reordered, cast and renamed to the partial schema here.
+/// over `states`. `states` must produce columns named `s0..sN` in the canonical layout (any
+/// column order, any types castable to the partial schema); they are mapped, cast and renamed
+/// to this plan's partial schema here.
 pub fn merge_plan(
     plan: &Arc<dyn ExecutionPlan>,
     states: Arc<dyn ExecutionPlan>,
+    group_names: &[String],
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let split = find_split(plan).ok_or_else(|| {
         NodraError::job("internal: no aggregate over the driving source found in the physical plan")
     })?;
     let agg = split.downcast_ref::<AggregateExec>().expect("aggregate");
+    // This plan's partial layout (before canonical reordering).
     let partial_schema = match agg.mode() {
         AggregateMode::Partial => agg.schema(),
-        _ => worker_plan(plan)?.schema(),
+        _ => AggregateExec::try_new(
+            AggregateMode::Partial,
+            agg.group_expr().clone(),
+            agg.aggr_expr().to_vec(),
+            agg.filter_expr().to_vec(),
+            agg.input().clone(),
+            agg.input_schema(),
+        )?
+        .schema(),
     };
-    let restored = restore_states(states, &partial_schema)?;
+    let order = canonical_order(&partial_schema, agg.group_expr().num_group_exprs(), group_names)?;
+    let restored = restore_states(states, &partial_schema, &order)?;
     // The operators above the split were planned for the split's output partitioning (often a
     // single partition, because the merge is planned over an empty placeholder). The state scan
     // can have any number of partitions, so reproduce that partitioning: either one partition,
@@ -188,11 +244,13 @@ fn rename_like(plan: Arc<dyn ExecutionPlan>, like: &SchemaRef) -> Result<Arc<dyn
     Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
 }
 
-/// Project `states` (columns `s0..sN`) to the partial schema: order, types and names.
-fn restore_states(states: Arc<dyn ExecutionPlan>, partial: &SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
+/// Project `states` (columns `s0..sN`, canonical layout) to the partial schema: order, types
+/// and names. `order[i]` is the partial-schema field stored as `s<i>`.
+fn restore_states(states: Arc<dyn ExecutionPlan>, partial: &SchemaRef, order: &[usize]) -> Result<Arc<dyn ExecutionPlan>> {
     let input = states.schema();
     let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::with_capacity(partial.fields().len());
-    for (i, f) in partial.fields().iter().enumerate() {
+    for (j, f) in partial.fields().iter().enumerate() {
+        let i = order.iter().position(|o| *o == j).expect("order is a permutation");
         let name = format!("s{i}");
         let idx = input
             .index_of(&name)

@@ -103,6 +103,15 @@ fn delta_field(f: &Field) -> Result<Field> {
 /// The schema Nodra writes to Delta for query output `schema`. All columns are nullable,
 /// so that schema evolution of the query does not trip over nullability.
 pub fn delta_schema(schema: &Schema) -> Result<SchemaRef> {
+    let mut seen = std::collections::HashSet::new();
+    for f in schema.fields() {
+        if !seen.insert(f.name().to_lowercase()) {
+            return Err(NodraError::job(format!(
+                "the query returns two columns named `{}` (Delta column names are case-insensitive); alias one of them",
+                f.name()
+            )));
+        }
+    }
     let fields = schema
         .fields()
         .iter()

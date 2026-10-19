@@ -49,7 +49,9 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let key = p.merge_progress_key();
     let merged = delta::txn_version(&sink, &key).await?;
     let latest = delta::version(&partials)? as i64;
-    if merged == Some(latest) {
+    // `>=`: a concurrent merge may already have merged a newer partials version than the
+    // snapshot opened here; merging this older one would move the sink backwards.
+    if merged.is_some_and(|m| m >= latest) {
         return Ok(MergeOutcome::UpToDate);
     }
     let all_files = delta::active_files(&partials)?;
@@ -94,7 +96,7 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let layout = delta::Layout::of(&partials)?;
     let states = FileListTable::try_new(layout.file_schema, layout.partition_fields, url, &files)?;
     let states_plan = states.scan(&ctx.state(), None, &[], None).await?;
-    let plan = partial::merge_plan(&physical, states_plan)?;
+    let plan = partial::merge_plan(&physical, states_plan, &p.plan.split_group_names)?;
     let stream = execute_stream(plan, ctx.task_ctx())?;
     let written = sink::write_stream(&sink, &delta::arrow_schema(&sink)?, sink::Columns::ByName, stream).await?;
     let rows = written.rows;

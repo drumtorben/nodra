@@ -313,74 +313,25 @@ pub async fn txn_version(t: &DeltaTable, app_id: &str) -> Result<Option<i64>> {
     Ok(t.snapshot()?.transaction_version(t.log_store().as_ref(), app_id).await?)
 }
 
-/// All application-transaction (`txn`) versions of the snapshot `t`, read in one pass over the
-/// latest checkpoint and the commits after it. delta-rs only offers a per-app-id lookup that
-/// replays the log every time, which is too slow for many progress keys.
-///
-/// Returns `None` for checkpoint layouts this reader does not handle (V2 checkpoints); callers
-/// then fall back to [`txn_version`].
-pub async fn txn_map(t: &DeltaTable) -> Result<Option<HashMap<String, i64>>> {
-    use datafusion::arrow::array::{Array, AsArray};
-    use datafusion::arrow::datatypes::Int64Type;
-    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use datafusion::parquet::arrow::ProjectionMask;
+/// All `txn` versions (`appId` -> version) of `t`'s snapshot, read in bulk from the newest
+/// checkpoint (classic, multi-part or V2) and the commits after it.
+pub async fn txn_map(t: &DeltaTable) -> Result<HashMap<String, i64>> {
     use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
 
     let v = version(t)?;
     let store = t.object_store();
-    let listed: Vec<object_store::ObjectMeta> =
-        store.list(Some(&Path::from("_delta_log"))).try_collect().await?;
-    // version -> (expected parts, files)
-    let mut checkpoints: std::collections::BTreeMap<u64, (usize, Vec<Path>)> = Default::default();
-    for meta in &listed {
-        let Some(name) = meta.location.filename() else { continue };
-        let parts: Vec<&str> = name.split('.').collect();
-        if parts.len() < 3 || parts[1] != "checkpoint" {
-            continue;
-        }
-        let Ok(cv) = parts[0].parse::<u64>() else { continue };
-        if cv > v {
-            continue;
-        }
-        match parts.as_slice() {
-            [_, _, "parquet"] => {
-                checkpoints.entry(cv).or_insert((1, Vec::new())).1.push(meta.location.clone());
-            }
-            [_, _, _part, total, "parquet"] => {
-                let total: usize = total.parse().unwrap_or(0);
-                let e = checkpoints.entry(cv).or_insert((total, Vec::new()));
-                e.1.push(meta.location.clone());
-            }
-            // V2 checkpoint (`<v>.checkpoint.<uuid>.parquet|json`) with sidecars.
-            _ => return Ok(None),
-        }
-    }
+    let listed: Vec<Path> =
+        store.list(Some(&Path::from("_delta_log"))).map_ok(|m| m.location).try_collect().await?;
     let mut map = HashMap::new();
-    let complete = checkpoints.into_iter().rev().find(|(_, (n, files))| *n > 0 && files.len() == *n);
-    let start = match complete {
-        Some((cv, (_, files))) => {
+    let start = match pick_checkpoint(&listed, v) {
+        Some((cv, files)) => {
             for path in files {
                 let bytes = store.get(&path).await?.bytes().await?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
-                let Some(idx) = builder.schema().fields().iter().position(|f| f.name() == "txn") else {
-                    continue;
-                };
-                let mask = ProjectionMask::roots(builder.parquet_schema(), [idx]);
-                for batch in builder.with_projection(mask).build()? {
-                    let batch = batch?;
-                    let txn = batch.column(0).as_struct();
-                    let (Some(app), Some(ver)) = (txn.column_by_name("appId"), txn.column_by_name("version")) else {
-                        continue;
-                    };
-                    let app = datafusion::arrow::compute::cast(app, &datafusion::arrow::datatypes::DataType::Utf8)?;
-                    let app = app.as_string::<i32>();
-                    let ver = ver.as_primitive::<Int64Type>();
-                    for i in 0..txn.len() {
-                        if txn.is_valid(i) && app.is_valid(i) && ver.is_valid(i) {
-                            map.insert(app.value(i).to_string(), ver.value(i));
-                        }
-                    }
+                if path.as_ref().ends_with(".json") {
+                    txns_from_json(&bytes, &mut map)?;
+                } else {
+                    txns_from_parquet(bytes, &mut map)?;
                 }
             }
             cv + 1
@@ -390,7 +341,92 @@ pub async fn txn_map(t: &DeltaTable) -> Result<Option<HashMap<String, i64>>> {
     if start <= v {
         map.extend(txns_in_commits(t, start, v).await?);
     }
-    Ok(Some(map))
+    Ok(map)
+}
+
+/// The newest complete checkpoint at or below `max_version` in a `_delta_log` listing: a
+/// classic (`<v>.checkpoint.parquet`), multi-part (`<v>.checkpoint.<i>.<n>.parquet`) or V2
+/// (`<v>.checkpoint.<uuid>.parquet|json`; its sidecars hold only file actions) checkpoint.
+fn pick_checkpoint(listed: &[Path], max_version: u64) -> Option<(u64, Vec<Path>)> {
+    // version -> (parts expected, files)
+    let mut found: std::collections::BTreeMap<u64, Vec<(usize, Vec<Path>)>> = Default::default();
+    let mut multi: std::collections::BTreeMap<(u64, usize), Vec<Path>> = Default::default();
+    for path in listed {
+        let Some(name) = path.filename() else { continue };
+        let parts: Vec<&str> = name.split('.').collect();
+        if parts.len() < 3 || parts[1] != "checkpoint" {
+            continue;
+        }
+        let Ok(cv) = parts[0].parse::<u64>() else { continue };
+        if cv > max_version {
+            continue;
+        }
+        match parts.as_slice() {
+            [_, _, "parquet"] => found.entry(cv).or_default().push((1, vec![path.clone()])),
+            [_, _, uuid, "parquet" | "json"] if uuid::Uuid::parse_str(uuid).is_ok() => {
+                found.entry(cv).or_default().push((1, vec![path.clone()]))
+            }
+            [_, _, _part, total, "parquet"] => {
+                if let Ok(total) = total.parse::<usize>() {
+                    multi.entry((cv, total)).or_default().push(path.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for ((cv, total), files) in multi {
+        found.entry(cv).or_default().push((total, files));
+    }
+    found.into_iter().rev().find_map(|(cv, candidates)| {
+        candidates.into_iter().find(|(n, files)| *n > 0 && files.len() == *n).map(|(_, files)| (cv, files))
+    })
+}
+
+fn txns_from_parquet<R: datafusion::parquet::file::reader::ChunkReader + 'static>(
+    bytes: R,
+    map: &mut HashMap<String, i64>,
+) -> Result<()> {
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use datafusion::parquet::arrow::ProjectionMask;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+    let Some(idx) = builder.schema().fields().iter().position(|f| f.name() == "txn") else {
+        return Ok(());
+    };
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [idx]);
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let txn = batch.column(0).as_struct();
+        let (Some(app), Some(ver)) = (txn.column_by_name("appId"), txn.column_by_name("version")) else {
+            continue;
+        };
+        let app = datafusion::arrow::compute::cast(app, &datafusion::arrow::datatypes::DataType::Utf8)?;
+        let app = app.as_string::<i32>();
+        let ver = ver.as_primitive::<Int64Type>();
+        for i in 0..txn.len() {
+            if txn.is_valid(i) && app.is_valid(i) && ver.is_valid(i) {
+                map.insert(app.value(i).to_string(), ver.value(i));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn txns_from_json(bytes: &[u8], map: &mut HashMap<String, i64>) -> Result<()> {
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) || !line.windows(6).any(|w| w == b"\"txn\":") {
+            continue;
+        }
+        let val: Value = serde_json::from_slice(line)?;
+        if let Some(txn) = val.get("txn") {
+            if let (Some(app), Some(ver)) = (txn.get("appId").and_then(Value::as_str), txn.get("version").and_then(Value::as_i64)) {
+                map.insert(app.to_string(), ver);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `txn` versions set by commits `from..=to` (later commits win).
@@ -401,17 +437,7 @@ pub async fn txns_in_commits(t: &DeltaTable, from: u64, to: u64) -> Result<HashM
         let bytes = log.read_commit_entry(cv).await?.ok_or_else(|| {
             NodraError::delta(format!("commit {cv} of {} is missing", t.table_url()))
         })?;
-        for line in bytes.split(|b| *b == b'\n') {
-            if line.iter().all(u8::is_ascii_whitespace) || !line.windows(6).any(|w| w == b"\"txn\":") {
-                continue;
-            }
-            let val: Value = serde_json::from_slice(line)?;
-            if let Some(txn) = val.get("txn") {
-                if let (Some(app), Some(ver)) = (txn.get("appId").and_then(Value::as_str), txn.get("version").and_then(Value::as_i64)) {
-                    map.insert(app.to_string(), ver);
-                }
-            }
-        }
+        txns_from_json(&bytes, &mut map)?;
     }
     Ok(map)
 }
@@ -710,5 +736,57 @@ mod tests {
     fn partition_keys_distinguish_null() {
         assert_ne!(partition_key(&[None]), partition_key(&[Some(String::new())]));
         assert_eq!(partition_key(&[Some("a".into()), None]), "=a/∅");
+    }
+}
+
+#[cfg(test)]
+mod txn_tests {
+    use super::*;
+
+    fn paths(names: &[&str]) -> Vec<Path> {
+        names.iter().map(|n| Path::from(format!("_delta_log/{n}"))).collect()
+    }
+
+    #[test]
+    fn picks_the_newest_complete_checkpoint() {
+        let uuid = "3a0d65cd-4056-49b8-937b-95f9e3ee90e5";
+        let listed = paths(&[
+            "00000000000000000010.checkpoint.parquet",
+            "00000000000000000020.checkpoint.0000000001.0000000002.parquet", // incomplete
+            &format!("00000000000000000015.checkpoint.{uuid}.json"),
+            &format!("00000000000000000030.checkpoint.{uuid}.parquet"), // newer than the snapshot
+            "00000000000000000025.checkpoint.notauuid.parquet",
+            "_last_checkpoint",
+        ]);
+        let (v, files) = pick_checkpoint(&listed, 29).unwrap();
+        assert_eq!(v, 15);
+        assert!(files[0].as_ref().ends_with(".json"));
+        assert_eq!(pick_checkpoint(&listed, 12).unwrap().0, 10);
+        assert!(pick_checkpoint(&listed, 5).is_none());
+        let listed = paths(&[
+            "00000000000000000020.checkpoint.0000000001.0000000002.parquet",
+            "00000000000000000020.checkpoint.0000000002.0000000002.parquet",
+        ]);
+        let (v, files) = pick_checkpoint(&listed, 20).unwrap();
+        assert_eq!((v, files.len()), (20, 2));
+    }
+
+    #[test]
+    fn reads_txns_from_v2_json_checkpoints() {
+        let body = concat!(
+            r#"{"checkpointMetadata":{"version":15}}"#,
+            "\n",
+            r#"{"txn":{"appId":"nodra/j/delta:/t/w0of2","version":7}}"#,
+            "\n",
+            r#"{"sidecar":{"path":"a.parquet","sizeInBytes":1,"modificationTime":1}}"#,
+            "\n",
+            r#"{"txn":{"appId":"nodra/j/merge","version":3,"lastUpdated":1}}"#,
+            "\n"
+        );
+        let mut map = HashMap::new();
+        txns_from_json(body.as_bytes(), &mut map).unwrap();
+        assert_eq!(map.get("nodra/j/delta:/t/w0of2"), Some(&7));
+        assert_eq!(map.get("nodra/j/merge"), Some(&3));
+        assert_eq!(map.len(), 2);
     }
 }

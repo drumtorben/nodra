@@ -11,7 +11,8 @@ use crate::settings::Settings;
 /// A DataFusion context configured from the job's engine settings
 /// (`SET datafusion.… = …`).
 ///
-/// The `aggregate_statistics` physical optimizer rule is disabled: it answers aggregates such
+/// Two optimizer options are fixed (see the comments below), and the `aggregate_statistics`
+/// physical optimizer rule is disabled: it answers aggregates such
 /// as `count(*)` from table statistics, which is wrong for Nodra because a worker only ever sees
 /// a slice of the input, and it would remove the aggregate the merge step relies on.
 pub fn new_context(settings: &Settings) -> Result<SessionContext> {
@@ -22,6 +23,12 @@ pub fn new_context(settings: &Settings) -> Result<SessionContext> {
             .set(k, v)
             .map_err(|e| NodraError::config(format!("invalid setting `{k} = {v}`: {e}")))?;
     }
+    let opts = config.options_mut();
+    // Uncorrelated scalar subqueries become joins (not a wrapper at the plan root, which the
+    // class-3 worker plan would cut off).
+    opts.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
+    // Keep aggregate group keys in their logical order where possible (see `partial`).
+    opts.optimizer.top_down_join_key_reordering = false;
     let rules = PhysicalOptimizer::new()
         .rules
         .into_iter()

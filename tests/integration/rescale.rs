@@ -1,5 +1,5 @@
 //! Changing the worker count of Delta-driven jobs (worker generations, see `nodra::rescale`).
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +37,7 @@ async fn scale_up_and_down_without_duplicates() {
         append(&src, events(next..next + 25)).await;
         next += 25;
     }
-    let status = nodra::status::render(&Pipeline::prepare(Job::parse(&rows, "x").unwrap()).await.unwrap(), None)
+    let status = nodra::status::render(&Pipeline::prepare(Job::parse(&rows, "x").unwrap()).await.unwrap())
         .await
         .unwrap();
     assert!(status.contains("workers: 1 (generation 4, previous run)"), "{status}");

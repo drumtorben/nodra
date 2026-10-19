@@ -70,34 +70,36 @@ fn delta_source_prefix(job: &Job, source: usize) -> String {
     format!("nodra/{}/{}/", job.name, job.sources[source].key())
 }
 
-/// The Delta source that earlier runs used as the driving source: the one with progress keys in
-/// the sink or the partials table. `None` for new jobs and stream jobs.
-async fn previous_driving(job: &Job) -> Result<Option<usize>> {
+/// How earlier runs split the input: the Delta source with progress keys in the sink or the
+/// partials table, or class-4 partition keys. `None` for new jobs and stream jobs.
+async fn previous_run(job: &Job) -> Result<Option<planner::Previous>> {
     let candidates: Vec<usize> =
         (0..job.sources.len()).filter(|i| matches!(job.sources[*i], SourceSpec::Delta { .. })).collect();
     if job.stream_source().is_some() || candidates.len() < 2 {
         return Ok(None);
     }
     let mut found = BTreeSet::new();
+    let mut copartitioned = false;
+    let part_prefix = format!("nodra/{}/part/", job.name);
     for location in [job.sink.uri().to_string(), partials_location(job)] {
         let Some(t) = delta::try_open(&location).await? else { continue };
-        let Some(all) = delta::txn_map(&t).await? else {
-            warn!(table = %location, "cannot list progress keys (v2 checkpoint); the driving source is chosen by size");
-            continue;
-        };
+        let all = delta::txn_map(&t).await?;
+        copartitioned |= all.keys().any(|k| k.starts_with(&part_prefix));
         for &i in &candidates {
             if !crate::rescale::generations(&all, &delta_source_prefix(job, i))?.is_empty() {
                 found.insert(i);
             }
         }
     }
-    match found.len() {
-        0 => Ok(None),
-        1 => Ok(found.pop_first()),
+    match (found.len(), copartitioned) {
+        (0, false) => Ok(None),
+        (0, true) => Ok(Some(planner::Previous::CoPartitioned)),
+        (1, false) => Ok(found.pop_first().map(planner::Previous::Driving)),
         _ => Err(NodraError::job(format!(
-            "the target tables hold progress for several driving sources ({}); \
-             start the job under a new nodra.job_name",
-            found.iter().map(|i| job.sources[*i].describe()).collect::<Vec<_>>().join(", ")
+            "the target tables hold progress of different ways to split this job ({}{}); start it under a new \
+             nodra.job_name",
+            found.iter().map(|i| job.sources[*i].describe()).collect::<Vec<_>>().join(", "),
+            if copartitioned { ", co-partitioned join" } else { "" }
         ))),
     }
 }
@@ -142,7 +144,7 @@ impl Pipeline {
     /// Inspect the sources and plan the job.
     pub async fn prepare(job: Job) -> Result<Pipeline> {
         let (infos, layouts) = source_infos(&job).await?;
-        let previous = previous_driving(&job).await?;
+        let previous = previous_run(&job).await?;
         let plan = planner::plan_job_with(&job, &infos, previous).await?;
         let sink_schema = types::delta_schema(&plan.output_schema)?;
         if matches!(job.sink, crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. })
@@ -159,7 +161,24 @@ impl Pipeline {
                 )));
             }
         }
-        Ok(Pipeline { job, plan, infos, sink_schema, layouts })
+        let pipeline = Pipeline { job, plan, infos, sink_schema, layouts };
+        if pipeline.plan.class == JobClass::MergeableAggregation {
+            pipeline.check_split().await?;
+        }
+        Ok(pipeline)
+    }
+
+    /// Class 3: build the worker plan and the merge plan once over empty inputs, so jobs whose
+    /// plan cannot be split fail before any worker starts.
+    async fn check_split(&self) -> Result<()> {
+        let ctx = session::new_context(&self.job.settings)?;
+        register_placeholders(&ctx, self).await?;
+        let physical = ctx.sql(&self.job.query).await?.create_physical_plan().await?;
+        let worker = partial::worker_plan(&physical, &self.plan.split_group_names)?;
+        let states = partial::state_schema(&worker.schema());
+        let empty = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(states));
+        partial::merge_plan(&physical, empty, &self.plan.split_group_names)?;
+        Ok(())
     }
 
     /// True for `mode => 'overwrite'` sinks.
@@ -456,7 +475,7 @@ impl Worker {
         self.invalidate();
         let t = delta::try_open(&self.p.target_location()).await?;
         if let Some(t) = &t {
-            self.all_txns = delta::txn_map(t).await?;
+            self.all_txns = Some(delta::txn_map(t).await?);
         }
         self.target = t.clone();
         self.loaded_at = Some(Instant::now());
@@ -487,7 +506,7 @@ impl Worker {
     /// Use `t` as the read snapshot from now on: forget progress read from older snapshots.
     async fn adopt(&mut self, t: &DeltaTable) -> Result<()> {
         self.known.clear();
-        self.all_txns = delta::txn_map(t).await?;
+        self.all_txns = Some(delta::txn_map(t).await?);
         self.target = Some(t.clone());
         self.loaded_at = Some(Instant::now());
         Ok(())
@@ -525,7 +544,7 @@ impl Worker {
             return self.step_overwrite(target, di, uri, *pinned).await;
         }
         let prefix = p.delta_source_prefix(di);
-        let placement = self.placement(&target, di, &prefix).await?;
+        let placement = self.placement(&target, &prefix).await?;
         let a_key = rescale::worker_key(&prefix, placement.generation, self.id.index, self.id.count);
         let b_key = rescale::snapshot_key(&a_key);
         let committed = self.progress(&target, &a_key).await?;
@@ -576,15 +595,28 @@ impl Worker {
         let layout = p.layouts[di].clone().expect("delta layout");
         match progress {
             None => {
+                // All workers of the first generation start from one source version (the first
+                // worker to commit records it): a snapshot per worker at different versions would
+                // lose or repeat rows around a compaction committed in between.
+                let start_key = rescale::start_key(&prefix);
+                let shared = self.progress(&target, &start_key).await?;
+                let record_start = |v: i64, txns: &mut Vec<Progress>| {
+                    if shared.is_none() {
+                        txns.push(Progress::new(&start_key, v, None));
+                    }
+                };
                 if p.job.settings.start()? == StartPosition::Latest && pinned.is_none() {
-                    info!(worker = self.id.index, version = latest, "starting at the latest source version");
-                    return self.commit_progress_only(target, vec![Progress::new(&a_key, latest, None)], false).await;
+                    let v = shared.unwrap_or(latest);
+                    info!(worker = self.id.index, version = v, "starting at the latest source version");
+                    let mut txns = vec![Progress::new(&a_key, v, None)];
+                    record_start(v, &mut txns);
+                    return self.commit_progress_only(target, txns, v < latest).await;
                 }
                 // Initial snapshot, processed in chunks of `max_files` files.
                 let b_committed = self.progress(&target, &b_key).await?;
                 let (snap_version, done) = match b_committed {
                     Some(b) => decode_snapshot(b),
-                    None => (latest, 0),
+                    None => (shared.unwrap_or(latest), 0),
                 };
                 let snap = delta::open_version(uri, snap_version).await?;
                 self.check_source_schema(di, &snap)?;
@@ -599,13 +631,15 @@ impl Worker {
                 let chunk: Vec<DataFile> = files.into_iter().skip(done).take(max_files).collect();
                 let done_after = done + chunk.len();
                 let last = done_after >= total;
-                let txn = if last {
-                    Progress::new(&a_key, snap_version, None)
-                } else {
-                    Progress::new(&b_key, encode_snapshot(snap_version, done_after)?, b_committed)
-                };
+                // Every snapshot commit writes the snapshot key, so two replicas of a worker that
+                // chunk differently still conflict with each other.
+                let mut txns = vec![Progress::new(&b_key, encode_snapshot(snap_version, done_after)?, b_committed)];
+                if last {
+                    txns.push(Progress::new(&a_key, snap_version, None));
+                }
+                record_start(snap_version, &mut txns);
                 self.metrics.lag.store((latest - snap_version) as u64, Ordering::Relaxed);
-                let step = self.process(target, Input::Files(vec![(di, snap, chunk)]), vec![txn]).await?;
+                let step = self.process(target, Input::Files(vec![(di, snap, chunk)]), txns).await?;
                 Ok(match step {
                     Step::Processed { .. } => Step::Processed { more: !last || snap_version < latest },
                     other => other,
@@ -707,24 +741,23 @@ impl Worker {
     /// This worker's generation (see [`crate::rescale`]), decided on its first batch. Fails if
     /// a newer generation exists: the job was restarted with another worker count, and this
     /// worker belongs to the old run.
-    async fn placement(&mut self, target: &Option<DeltaTable>, di: usize, prefix: &str) -> Result<rescale::Placement> {
+    async fn placement(&mut self, target: &Option<DeltaTable>, prefix: &str) -> Result<rescale::Placement> {
+        if let (Some(t), None) = (target, &self.all_txns) {
+            self.all_txns = Some(delta::txn_map(t).await?);
+        }
         let gens = match (target, &self.all_txns) {
-            (None, _) => BTreeMap::new(),
             (Some(_), Some(all)) => rescale::generations(all, prefix)?,
-            (Some(t), None) => {
-                // The progress keys cannot be listed (v2 checkpoint): no rescaling.
-                for n in (1..=64u32).filter(|n| *n != self.id.count) {
-                    if delta::txn_version(t, &self.p.delta_progress_key(di, 0, n)).await?.is_some() {
-                        return Err(NodraError::config(format!(
-                            "the job ran with {n} workers before; changing the worker count needs a target \
-                             table without v2 checkpoints"
-                        )));
-                    }
-                }
-                return Ok(rescale::Placement { generation: 0, handover: None });
-            }
+            _ => BTreeMap::new(),
         };
         if let Some(pl) = &self.placement {
+            if let Some(g) = gens.get(&pl.generation).filter(|g| g.count != self.id.count) {
+                self.placement = None;
+                return Err(NodraError::config(format!(
+                    "the job was started with {} workers at the same time as this run with {} workers; run it with one \
+                     worker count",
+                    g.count, self.id.count
+                )));
+            }
             if let Some((&newest, g)) = gens.iter().next_back() {
                 if newest > pl.generation {
                     return Err(NodraError::config(format!(
@@ -769,12 +802,9 @@ impl Worker {
         let start = self.p.job.settings.start()?;
         let max = self.p.job.settings.max_records_per_partition()?;
         let skip_bad = self.p.job.settings.skip_bad_messages()?;
-        let parts: Vec<i32> = src
-            .partitions()
-            .await?
-            .into_iter()
-            .filter(|p| (p.rem_euclid(self.id.count as i32)) as u32 == self.id.index)
-            .collect();
+        let all_parts = src.partitions().await?;
+        let parts: Vec<i32> =
+            all_parts.iter().copied().filter(|p| (p.rem_euclid(self.id.count as i32)) as u32 == self.id.index).collect();
         if parts.is_empty() {
             return Ok(Step::Idle);
         }
@@ -787,18 +817,43 @@ impl Worker {
             let key = self.p.stream_progress_key(si, part);
             committed_by_part.push((part, key.clone(), self.progress(&target, &key).await?));
         }
-        // `start = latest` applies when none of this worker's partitions has progress (the job
-        // starts); partitions that appear later start at their earliest offset.
-        let first_start = committed_by_part.iter().all(|(_, _, c)| c.is_none());
+        // `start = latest`: the first worker to commit records the high watermark of every
+        // partition at that moment (`…/start/p<k>`). A partition without progress starts there; a
+        // partition without such a record appeared later and starts at its beginning. So a worker
+        // that starts late does not skip messages, and new partitions are read completely.
+        let prefix = self.p.delta_source_prefix(si);
+        let mut start_at: HashMap<i32, i64> = HashMap::new();
+        let mut first_start = false;
+        if start == StartPosition::Latest && committed_by_part.iter().any(|(_, _, c)| c.is_none()) {
+            if let (Some(t), None) = (&target, &self.all_txns) {
+                self.all_txns = Some(delta::txn_map(t).await?);
+            }
+            let recorded = rescale::stream_starts(self.all_txns.as_ref().filter(|_| target.is_some()), &prefix);
+            if recorded.is_empty() {
+                first_start = true;
+                for &part in &all_parts {
+                    let (_, high) = src.watermarks(part).await?;
+                    start_at.insert(part, high);
+                    txns.push(Progress::new(rescale::stream_start_key(&prefix, part), high, None));
+                }
+            } else {
+                start_at = recorded;
+            }
+        }
         for (part, key, committed) in committed_by_part {
             let (low, high) = src.watermarks(part).await?;
-            let from = match committed {
-                Some(o) => o,
-                None if start == StartPosition::Latest && first_start => {
-                    txns.push(Progress::new(&key, high, None));
-                    high
-                }
-                None => low,
+            let from = match (committed, start) {
+                (Some(o), _) => o,
+                (None, StartPosition::Earliest) => low,
+                (None, StartPosition::Latest) => match start_at.get(&part) {
+                    Some(&s) => {
+                        if first_start {
+                            txns.push(Progress::new(&key, s, None));
+                        }
+                        s
+                    }
+                    None => low,
+                },
             };
             if from < low {
                 return Err(NodraError::Source(format!(
@@ -857,8 +912,11 @@ impl Worker {
                 None => delta::open(uri).await?,
             };
             self.check_source_schema(di, &t)?;
+            let fields = p.layouts[di].as_ref().map(|l| l.partition_fields.clone()).unwrap_or_default();
             for f in delta::active_files(&t)? {
-                let entry = by_partition.entry(f.partition_key()).or_insert_with(|| vec![Vec::new(); driving.len()]);
+                // Typed values: writers spell e.g. timestamps differently.
+                let key = typed_partition_key(&f, &fields)?;
+                let entry = by_partition.entry(key).or_insert_with(|| vec![Vec::new(); driving.len()]);
                 entry[slot].push(f);
             }
             tables.push(t);
@@ -1034,7 +1092,7 @@ impl Worker {
         let ctx = session::new_context(&self.p.job.settings)?;
         register_placeholders(&ctx, &self.p).await?;
         let physical = ctx.sql(&self.p.job.query).await?.create_physical_plan().await?;
-        let partial = partial::worker_plan(&physical)?;
+        let partial = partial::worker_plan(&physical, &self.p.plan.split_group_names)?;
         let schema = types::delta_schema(&partial::state_schema(&partial.schema()))?;
         self.state_schema = Some(schema.clone());
         Ok(schema)
@@ -1063,7 +1121,7 @@ impl Worker {
         }
         let physical = ctx.sql(&p.job.query).await?.create_physical_plan().await?;
         let (plan, target_schema) = if p.plan.class == JobClass::MergeableAggregation {
-            let partial = partial::worker_plan(&physical)?;
+            let partial = partial::worker_plan(&physical, &p.plan.split_group_names)?;
             let schema = types::delta_schema(&partial::state_schema(&partial.schema()))?;
             self.state_schema = Some(schema.clone());
             (partial, schema)
@@ -1119,6 +1177,24 @@ impl Worker {
             }
         }
     }
+}
+
+/// A partition key built from the typed partition values (`partition_key` of their canonical
+/// renderings), so that equal values written in different spellings match.
+fn typed_partition_key(f: &DataFile, fields: &[datafusion::arrow::datatypes::FieldRef]) -> Result<String> {
+    if fields.len() != f.partition_values.len() {
+        return Ok(f.partition_key());
+    }
+    let values = f
+        .partition_values
+        .iter()
+        .zip(fields)
+        .map(|(v, field)| match v {
+            None => Ok(None),
+            Some(_) => crate::scan::partition_scalar(v.as_deref(), field).map(|s| Some(s.to_string())),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(delta::partition_key(&values))
 }
 
 /// A positive fingerprint of the files of one class-4 partition (stored as its progress value).

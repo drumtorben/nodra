@@ -3,7 +3,7 @@
 //! Most cases come from an independent review of the planner's classification.
 //!
 //! Every case prints `OUTCOME <name>: …` (`-- --nocapture` shows them).
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;

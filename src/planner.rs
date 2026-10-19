@@ -112,6 +112,9 @@ pub struct JobPlan {
     pub output_schema: SchemaRef,
     /// Class 3: merge scope.
     pub merge_scope: Option<MergeScope>,
+    /// Class 3: names of the split aggregate's group columns, in logical order (the canonical
+    /// layout of partial states, see [`crate::partial`]).
+    pub split_group_names: Vec<String>,
     /// Human-readable notes collected while planning.
     pub notes: Vec<String>,
 }
@@ -128,15 +131,24 @@ impl JobPlan {
     }
 }
 
+/// How earlier runs of a job split their input, read from the progress keys in its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Previous {
+    /// Delta source `i` was the driving source (classes 1–3).
+    Driving(usize),
+    /// The job ran as a co-partitioned join (class 4).
+    CoPartitioned,
+}
+
 /// Classify `job`. `infos[i]` describes `job.sources[i]`.
 pub async fn plan_job(job: &Job, infos: &[SourceInfo]) -> Result<JobPlan> {
     plan_job_with(job, infos, None).await
 }
 
-/// Like [`plan_job`]; `previous_driving` is the Delta source that earlier runs of the job split
-/// across workers (it has progress in the target table). It stays the driving source, because
-/// switching would process the new driving table from scratch and duplicate the output.
-pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous_driving: Option<usize>) -> Result<JobPlan> {
+/// Like [`plan_job`], keeping the way earlier runs split the input (`previous`): switching the
+/// driving source or the class would process the input again under new progress keys and
+/// duplicate the output.
+pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Previous>) -> Result<JobPlan> {
     let threshold = job.settings.broadcast_threshold()?;
     let ctx = session::new_context(&job.settings)?;
     for (i, info) in infos.iter().enumerate() {
@@ -184,6 +196,10 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous_driving: Op
         // Tables on the non-preserved side of an outer, semi or anti join, or read only in a
         // subquery, cannot be split: every worker would see all rows of the other side.
         let secondary = secondary_tables(&plan);
+        let previous_driving = match previous {
+            Some(Previous::Driving(i)) => Some(i),
+            _ => None,
+        };
         let driving = match previous_driving {
             Some(i) if forced_broadcast(i) => {
                 return Err(NodraError::job(format!(
@@ -215,9 +231,29 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous_driving: Op
             ));
         }
         for &i in &by_size {
-            if i != driving && !broadcastable(&job.sources[i], &infos[i], threshold) {
+            let large_now = !broadcastable(&job.sources[i], &infos[i], threshold);
+            // A class-4 job stays one: its second table keeps being split by partition.
+            let was_copartitioned = previous == Some(Previous::CoPartitioned) && large.len() == 1 && !forced_broadcast(i);
+            if i != driving && (large_now || was_copartitioned) {
                 large.push(i);
             }
+        }
+        if previous == Some(Previous::CoPartitioned) && large.len() < 2 {
+            return Err(NodraError::job(
+                "earlier runs of this job were a co-partitioned join of two tables; start it under a new nodra.job_name",
+            ));
+        }
+        if previous_driving.is_some() && large.len() > 1 {
+            let i = large[1];
+            return Err(NodraError::job(format!(
+                "{} ({}) has grown beyond nodra.broadcast_threshold ({} > {}), but earlier runs of this job broadcast it; \
+                 raise nodra.broadcast_threshold or set broadcast => true to keep the job as it is, or start it under a \
+                 new nodra.job_name",
+                source_table(i),
+                job.sources[i].describe(),
+                human_bytes(infos[i].size_bytes.unwrap_or(0)),
+                human_bytes(threshold)
+            )));
         }
         for &i in &large {
             roles[i] = Role::Driving;
@@ -299,6 +335,7 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous_driving: Op
     };
 
     let mut merge_scope = None;
+    let mut split_group_names = Vec::new();
     if let Some(agg) = &walk.aggregate {
         if class == JobClass::CoPartitionedJoin {
             // Checked by `check_partition_local`: class 4 processes every partition once and
@@ -308,12 +345,21 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous_driving: Op
             // workers, so every other aggregation is finalized by the merge step.
             class = JobClass::MergeableAggregation;
             merge_scope = Some(merge_scope_for(&plan, job.sink.partition_by(), agg));
+            let n = agg.schema.fields().len() - agg.aggr_expr.len();
+            split_group_names = agg.schema.fields().iter().take(n).map(|f| f.name().clone()).collect();
+            let unique: BTreeSet<&String> = split_group_names.iter().collect();
+            if unique.len() != split_group_names.len() {
+                return Err(NodraError::rejected(
+                    format!("the aggregation has several group keys with the same name ({})", split_group_names.join(", ")),
+                    "alias them in a subquery so that every group key has its own name",
+                ));
+            }
         }
     }
     if class == JobClass::CoPartitionedJoin && job.stream_source().is_some() {
         return Err(NodraError::rejected("co-partitioned join with a stream", "stream joins need broadcast tables"));
     }
-    Ok(JobPlan { class, roles, unit_key, output_schema, merge_scope, notes })
+    Ok(JobPlan { class, roles, unit_key, output_schema, merge_scope, split_group_names, notes })
 }
 
 fn broadcastable(spec: &SourceSpec, info: &SourceInfo, threshold: u64) -> bool {
@@ -746,6 +792,8 @@ fn merge_scope_for(
             return MergeScope::Full;
         };
         match group_key_origin(plan, &Column::new(q.cloned(), f.name()), split) {
+            // Two sink partition columns derived from one group key: keep it simple.
+            Some(k) if out.iter().any(|(_, o)| *o == k) => return MergeScope::Full,
             Some(k) => out.push((p.clone(), k)),
             None => return MergeScope::Full,
         }
@@ -1127,7 +1175,7 @@ mod tests {
         let p = plan(sql, vec![small_events.clone(), dim()]).await.unwrap();
         assert_eq!(p.roles, vec![Role::Broadcast, Role::Driving]);
         let job = Job::parse(sql, "t").unwrap();
-        let p = plan_job_with(&job, &[small_events, dim()], Some(0)).await.unwrap();
+        let p = plan_job_with(&job, &[small_events, dim()], Some(Previous::Driving(0))).await.unwrap();
         assert_eq!(p.roles, vec![Role::Driving, Role::Broadcast]);
     }
 

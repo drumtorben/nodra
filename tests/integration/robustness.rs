@@ -1,5 +1,5 @@
-//! Failure handling: crashes, zombie workers, source changes (rescaling: `tests/rescale.rs`).
-mod common;
+//! Failure handling: crashes, zombie workers, source changes (rescaling: `rescale*`).
+use crate::common;
 
 use std::sync::Arc;
 

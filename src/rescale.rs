@@ -7,12 +7,13 @@
 //! the keys `<prefix>g<g>/w<i>of<n>`.
 //!
 //! Starting the job with a different worker count starts a new generation. Its workers begin at
-//! the smallest progress of the previous generation and skip every file that the previous
-//! owner already processed: file `f` added in version `v` was processed iff
-//! `v <= done[fnv(f) mod m]`. The handover only needs the previous generation's final progress,
-//! so its workers must have stopped; the first commit of the new generation also rewrites the
-//! old progress keys, which makes a still-running old worker's next commit fail Delta's
-//! conflict check, and old workers stop once they see a newer generation.
+//! the smallest progress of the previous generation and skip every file that an earlier
+//! generation already processed: file `f` added in version `v` was processed by generation `g`
+//! (with `m` workers and final progress `done`) iff `v <= done[fnv(f) mod m]`. The handover
+//! needs the final progress of the earlier generations, so their workers must have stopped; the
+//! first commit of the new generation also rewrites the previous generation's progress keys,
+//! which makes a still-running old worker's next commit fail Delta's conflict check, and old
+//! workers stop once they see a newer generation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -26,6 +27,25 @@ pub fn worker_key(prefix: &str, generation: u32, i: u32, n: u32) -> String {
     } else {
         format!("{prefix}g{generation}/w{i}of{n}")
     }
+}
+
+/// The source version all workers of the first generation start from.
+pub fn start_key(prefix: &str) -> String {
+    format!("{prefix}start")
+}
+
+/// The high watermark of stream partition `partition` when the job started (`start = latest`).
+pub fn stream_start_key(prefix: &str, partition: i32) -> String {
+    format!("{prefix}start/p{partition}")
+}
+
+/// All recorded stream start offsets (see [`stream_start_key`]), by partition.
+pub fn stream_starts(all: Option<&HashMap<String, i64>>, prefix: &str) -> HashMap<i32, i64> {
+    let start = format!("{prefix}start/p");
+    all.into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.strip_prefix(&start)?.parse::<i32>().ok()?, *v)))
+        .collect()
 }
 
 /// Snapshot-chunk key that belongs to a worker key.
@@ -96,7 +116,7 @@ pub struct Placement {
     pub handover: Option<Handover>,
 }
 
-/// The final progress of the previous generation.
+/// The final progress of the previous generation (and of the ones before it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handover {
     /// The previous generation.
@@ -105,6 +125,8 @@ pub struct Handover {
     pub count: u32,
     /// Last processed source version of each of its workers.
     pub done: Vec<i64>,
+    /// Worker count and final progress of every generation before the previous one.
+    pub earlier: Vec<(u32, Vec<i64>)>,
 }
 
 impl Handover {
@@ -114,9 +136,10 @@ impl Handover {
     }
 
     /// True if the file at `path`, added in source version `version`, was already processed by
-    /// the previous generation.
+    /// an earlier generation.
     pub fn processed(&self, path: &str, version: i64) -> bool {
         version <= self.done[worker_for(path, self.count) as usize]
+            || self.earlier.iter().any(|(n, done)| version <= done[worker_for(path, *n) as usize])
     }
 
     /// True while the handover can still skip files (versions up to the largest old progress).
@@ -159,7 +182,12 @@ pub fn place(gens: &BTreeMap<u32, Generation>, count: u32) -> Result<Placement> 
                     }
                 }
             }
-            Some(Handover { generation: prev, count: g.count, done })
+            // Earlier generations were complete when their successors took over.
+            let earlier = gens
+                .range(..prev)
+                .map(|(_, e)| (e.count, (0..e.count).map(|j| e.done.get(&j).copied().unwrap_or(-1)).collect()))
+                .collect();
+            Some(Handover { generation: prev, count: g.count, done, earlier })
         }
     };
     Ok(Placement { generation, handover })
@@ -211,7 +239,9 @@ mod tests {
             .unwrap();
         let p = place(&g, 2).unwrap();
         assert_eq!(p.generation, 2);
-        assert_eq!(p.handover.unwrap().done, vec![20, 21, 22]);
+        let h = p.handover.unwrap();
+        assert_eq!(h.done, vec![20, 21, 22]);
+        assert_eq!(h.earlier, vec![(2, vec![10, 12])]);
         // The previous generation must have progress for every worker.
         let g = generations(&all(&[("w0of2", 10), ("w1of2/snapshot", 3)]), P).unwrap();
         assert!(place(&g, 3).unwrap_err().to_string().contains("initial snapshot"));
@@ -221,7 +251,7 @@ mod tests {
 
     #[test]
     fn handover_skips_files_of_the_previous_owner() {
-        let h = Handover { generation: 0, count: 2, done: vec![10, 20] };
+        let h = Handover { generation: 0, count: 2, done: vec![10, 20], earlier: vec![] };
         let (a, b) = ((0..).map(|i| format!("f{i}")).find(|f| worker_for(f, 2) == 0).unwrap(), {
             (0..).map(|i| format!("f{i}")).find(|f| worker_for(f, 2) == 1).unwrap()
         });

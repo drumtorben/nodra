@@ -2,7 +2,7 @@
 //! stream jobs). A FIFO used as a `jsonl_stream` partition file pauses the worker
 //! deterministically inside a batch (after it read its progress, before it commits), so the
 //! test can commit as a "zombie" replica in that window.
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

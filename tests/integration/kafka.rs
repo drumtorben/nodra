@@ -1,8 +1,7 @@
 //! The Kafka source against librdkafka's in-process mock cluster (real Kafka protocol over TCP).
-//! Run with `cargo test --features kafka --test kafka`.
-#![cfg(feature = "kafka")]
+//! Run with `cargo test --features kafka --test integration kafka::`.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
