@@ -178,7 +178,7 @@ Integration tests are one binary (`cargo test --test integration rescale::` runs
 `Cargo.lock` is resolved against crates.io. The code was developed in an environment without
 crates.io access, against the same crate versions built from their GitHub sources; the one
 exception is `buoyant_kernel_engine`, where crates.io has 0.28.0 and the tested build used the
-0.28.1 commit (`ab66589`) that `buoyant_kernel` 0.28.1 was released from.
+0.28.1 sources (buoyant-data/delta-kernel-rs, commit `ab66589`).
 
 `jsonl_stream('<dir>')` is a broker-free stand-in for Kafka (one file per partition, one
 message per line) used by the tests and the demo.
