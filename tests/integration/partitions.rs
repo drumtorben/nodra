@@ -1,5 +1,5 @@
 //! Class-4 partition progress and class-3 partition-scoped merges.
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

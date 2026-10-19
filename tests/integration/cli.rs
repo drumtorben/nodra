@@ -1,5 +1,5 @@
 //! The `nodra` binary end to end.
-mod common;
+use crate::common;
 
 use std::process::Command;
 

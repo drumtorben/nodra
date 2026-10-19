@@ -1,5 +1,5 @@
 //! Sink writes: column mapping, overwrite mode, and a plan shape that must be rejected.
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

@@ -1,5 +1,5 @@
 //! Class 4, partition-scoped merges, partition value encoding, overwrite mode.
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

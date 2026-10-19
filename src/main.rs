@@ -92,7 +92,7 @@ async fn real_main(args: Vec<String>) -> Result<()> {
         }
         Command::Status(common) => {
             let p = prepare(&common).await?;
-            print!("{}", status::render(&p, None).await?);
+            print!("{}", status::render(&p).await?);
             Ok(())
         }
         Command::Run(run) => run_cmd(run).await,

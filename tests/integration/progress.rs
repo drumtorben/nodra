@@ -1,5 +1,5 @@
 //! Progress tracking of Delta driving sources, and progress lookup after checkpoints.
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

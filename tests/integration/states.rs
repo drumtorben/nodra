@@ -1,5 +1,5 @@
 //! Partial-state round trips through the partials Delta table (types, lists, views).
-mod common;
+use crate::common;
 
 use common::*;
 

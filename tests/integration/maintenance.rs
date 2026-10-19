@@ -2,7 +2,7 @@
 //! computed from their read snapshot, and delta-rs (1.1.2) does not treat a concurrent OPTIMIZE
 //! (dataChange=false removes/adds) as a conflict: the merge must recompute its removes on the
 //! compacted snapshot, or the compacted copy of the old rows survives next to the new ones.
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;

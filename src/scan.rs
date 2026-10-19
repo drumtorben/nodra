@@ -107,7 +107,11 @@ impl FileListTable {
             .map(|i| ScalarValue::iter_to_array(self.files.iter().map(|f| f.partition_values[i].clone())))
             .collect::<DfResult<Vec<ArrayRef>>>()?;
         let batch = RecordBatch::try_new(schema, columns)?;
-        let mask = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+        // A filter that fails on some partition values (e.g. a guarded division) only means
+        // that pruning is not possible; DataFusion evaluates it on the rows anyway.
+        let Ok(mask) = predicate.evaluate(&batch).and_then(|m| m.into_array(batch.num_rows())) else {
+            return Ok(self.files.clone());
+        };
         let Some(mask) = mask.as_any().downcast_ref::<BooleanArray>() else {
             return Ok(self.files.clone());
         };

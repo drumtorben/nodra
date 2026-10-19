@@ -201,9 +201,9 @@ impl SourceSpec {
     /// Stable identifier used in progress keys.
     pub fn key(&self) -> String {
         match self {
-            SourceSpec::Delta { uri, .. } => format!("delta:{}", uri.trim_end_matches('/')),
+            SourceSpec::Delta { uri, .. } => format!("delta:{}", normalize_location(uri)),
             SourceSpec::Kafka { topic, .. } => format!("kafka:{topic}"),
-            SourceSpec::JsonlStream { dir, .. } => format!("jsonl:{}", dir.trim_end_matches('/')),
+            SourceSpec::JsonlStream { dir, .. } => format!("jsonl:{}", normalize_location(dir)),
         }
     }
 
@@ -701,6 +701,38 @@ fn rewrite_query(query: &str) -> Result<(String, Vec<SourceSpec>)> {
     Ok((stmts[0].to_string(), rw.sources))
 }
 
+/// A canonical spelling of a table location, so that `/x/events`, `/x/./events/` and
+/// `file:///x/events` name the same table: URLs are normalized (`.`/`..` segments, no trailing
+/// slash), local paths made absolute and normalized lexically (symlinks are not resolved).
+pub fn normalize_location(location: &str) -> String {
+    if let Ok(url) = url::Url::parse(location) {
+        if url.scheme() != "file" && url.scheme().len() > 1 {
+            return url.as_str().trim_end_matches('/').to_string();
+        }
+        if let Ok(path) = url.to_file_path() {
+            return normalize_path(&path);
+        }
+    }
+    normalize_path(std::path::Path::new(location))
+}
+
+fn normalize_path(path: &std::path::Path) -> String {
+    use std::path::Component;
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = std::path::PathBuf::new();
+    for c in absolute.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    let s = out.to_string_lossy().to_string();
+    if s.len() > 1 { s.trim_end_matches('/').to_string() } else { s }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,5 +818,18 @@ mod tests {
             "f"
         )
         .is_err());
+    }
+
+    #[test]
+    fn locations_are_normalized() {
+        assert_eq!(normalize_location("/x/events"), "/x/events");
+        assert_eq!(normalize_location("/x/./events/"), "/x/events");
+        assert_eq!(normalize_location("/x/y/../events"), "/x/events");
+        assert_eq!(normalize_location("file:///x/events/"), "/x/events");
+        assert_eq!(
+            normalize_location("abfss://c@a.dfs.core.windows.net/lake/./t/"),
+            "abfss://c@a.dfs.core.windows.net/lake/t"
+        );
+        assert!(normalize_location("rel/events").ends_with("/rel/events"));
     }
 }
