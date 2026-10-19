@@ -21,7 +21,11 @@ async fn scale_up_and_down_without_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let (src, out, agg) = (dir.path().join("events"), dir.path().join("out"), dir.path().join("agg"));
     events_table(&src, 3, 20).await;
-    let rows = format!("SET nodra.job_name = 'rows'; INSERT INTO delta('{}') SELECT id, cid, v FROM delta('{}')", loc(&out), loc(&src));
+    let rows = format!(
+        "SET nodra.job_name = 'rows'; INSERT INTO delta('{}') SELECT id, cid, v FROM delta('{}')",
+        loc(&out),
+        loc(&src)
+    );
     let sums = format!(
         "SET nodra.job_name = 'sums'; INSERT INTO delta('{}', partition_by => 'day') \
          SELECT day, cid, count(*) AS n, sum(v) AS s FROM delta('{}') GROUP BY day, cid",
@@ -102,7 +106,10 @@ async fn old_workers_that_keep_running_are_fenced() {
     for k in 0..6 {
         append(&src, events(200 + k * 10..210 + k * 10)).await;
     }
-    let res = tokio::time::timeout(Duration::from_secs(60), zombie).await.expect("old worker never stopped").unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(60), zombie)
+        .await
+        .expect("old worker never stopped")
+        .unwrap();
     let _ = stop.send(true);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("restarted with 3 workers"), "{err}");

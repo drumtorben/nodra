@@ -30,7 +30,7 @@ async fn merge_racing_sink_optimize_keeps_one_row_per_group() {
         append(&src, events(100 + round as i64 * 10..110 + round as i64 * 10)).await;
         let (_tx, rx) = watch::channel(false);
         exec::run_worker(p.clone(), WorkerId { index: 0, count: 1 }, true, rx).await.unwrap(); // partials only
-        // Someone compacts the sink while the merge step runs.
+                                                                                               // Someone compacts the sink while the merge step runs.
         let (m, _) = tokio::join!(nodra::merge::merge(&p), async {
             tokio::time::sleep(Duration::from_millis(round * 4)).await;
             compact(&out).await;

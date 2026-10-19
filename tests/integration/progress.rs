@@ -53,9 +53,15 @@ async fn once_run_continues_after_progress_only_commit() {
     let mut t = delta::open(&loc(&src)).await.unwrap();
     let parts = vec!["day".to_string()];
     for i in 0..1100 {
-        match delta::commit(&mut t, vec![], vec![Transaction::new("other-app", i)], delta::append_op(&parts), 3)
-            .await
-            .unwrap()
+        match delta::commit(
+            &mut t,
+            vec![],
+            vec![Transaction::new("other-app", i)],
+            delta::append_op(&parts),
+            3,
+        )
+        .await
+        .unwrap()
         {
             CommitOutcome::Committed(_) => {}
             other => panic!("{other:?}"),

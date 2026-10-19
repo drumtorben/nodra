@@ -80,11 +80,8 @@ impl StreamSource for JsonlStream {
         let lines = self.lines(partition).await?;
         let start = from.max(0) as usize;
         let end = (until.max(0) as usize).min(lines.len()).min(start.saturating_add(max));
-        let payloads = if start < end {
-            lines[start..end].iter().cloned().map(Some).collect()
-        } else {
-            Vec::new()
-        };
+        let payloads =
+            if start < end { lines[start..end].iter().cloned().map(Some).collect() } else { Vec::new() };
         Ok(Fetched { payloads, first_offset: from, next_offset: end.max(start) as i64 })
     }
 }

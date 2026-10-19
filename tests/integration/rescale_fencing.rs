@@ -19,7 +19,11 @@ async fn old_worker_commit_from_before_the_fence_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     let (src, out) = (dir.path().join("events"), dir.path().join("out"));
     events_table(&src, 2, 20).await;
-    let sql = format!("SET nodra.job_name = 'fenceprobe'; INSERT INTO delta('{}') SELECT id FROM delta('{}')", loc(&out), loc(&src));
+    let sql = format!(
+        "SET nodra.job_name = 'fenceprobe'; INSERT INTO delta('{}') SELECT id FROM delta('{}')",
+        loc(&out),
+        loc(&src)
+    );
     run_once(&sql, 2).await.unwrap();
     let read = delta::version(&delta::open(&loc(&out)).await.unwrap()).unwrap();
     for k in 0..3 {
@@ -30,7 +34,10 @@ async fn old_worker_commit_from_before_the_fence_conflicts() {
     for j in 0..2 {
         let mut t = delta::open_version(&loc(&out), read as i64).await.unwrap();
         let key = p.delta_progress_key(0, j, 2);
-        let outcome = delta::commit(&mut t, vec![], vec![Transaction::new(&key, 99)], delta::append_op(&[]), 50).await.unwrap();
+        let outcome =
+            delta::commit(&mut t, vec![], vec![Transaction::new(&key, 99)], delta::append_op(&[]), 50)
+                .await
+                .unwrap();
         assert!(matches!(outcome, CommitOutcome::Conflict), "old worker {j}: {outcome:?}");
     }
 }
@@ -52,7 +59,11 @@ fn spend(days: &[&str], per_day: i64) -> RecordBatch {
             Field::new("w", DataType::Float64, true),
             Field::new("day", DataType::Utf8, true),
         ])),
-        vec![Arc::new(Int64Array::from(cid)) as ArrayRef, Arc::new(Float64Array::from(w)), Arc::new(StringArray::from(day))],
+        vec![
+            Arc::new(Int64Array::from(cid)) as ArrayRef,
+            Arc::new(Float64Array::from(w)),
+            Arc::new(StringArray::from(day)),
+        ],
     )
     .unwrap()
 }

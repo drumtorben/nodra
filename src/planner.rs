@@ -155,10 +155,7 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
         let table = MemTable::try_new(info.schema.clone(), vec![vec![]])?;
         ctx.register_table(source_table(i), Arc::new(table))?;
     }
-    let df = ctx
-        .sql(&job.query)
-        .await
-        .map_err(|e| NodraError::job(format!("cannot plan query: {e}")))?;
+    let df = ctx.sql(&job.query).await.map_err(|e| NodraError::job(format!("cannot plan query: {e}")))?;
     let output_schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
     // Physical planning surfaces queries DataFusion cannot execute before any worker starts.
     df.clone()
@@ -192,7 +189,8 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
         // Largest first; ties in order of appearance.
         let mut by_size: Vec<usize> = (0..job.sources.len()).collect();
         by_size.sort_by_key(|i| std::cmp::Reverse(infos[*i].size_bytes.unwrap_or(0)));
-        let forced_broadcast = |i: usize| matches!(job.sources[i], SourceSpec::Delta { broadcast: Some(true), .. });
+        let forced_broadcast =
+            |i: usize| matches!(job.sources[i], SourceSpec::Delta { broadcast: Some(true), .. });
         // Tables on the non-preserved side of an outer, semi or anti join, or read only in a
         // subquery, cannot be split: every worker would see all rows of the other side.
         let secondary = secondary_tables(&plan);
@@ -233,7 +231,8 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
         for &i in &by_size {
             let large_now = !broadcastable(&job.sources[i], &infos[i], threshold);
             // A class-4 job stays one: its second table keeps being split by partition.
-            let was_copartitioned = previous == Some(Previous::CoPartitioned) && large.len() == 1 && !forced_broadcast(i);
+            let was_copartitioned =
+                previous == Some(Previous::CoPartitioned) && large.len() == 1 && !forced_broadcast(i);
             if i != driving && (large_now || was_copartitioned) {
                 large.push(i);
             }
@@ -277,9 +276,15 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
         if *role != Role::Driving {
             continue;
         }
-        if let Some(j) = (0..job.sources.len()).find(|j| *j != i && job.sources[*j].key() == job.sources[i].key()) {
+        if let Some(j) =
+            (0..job.sources.len()).find(|j| *j != i && job.sources[*j].key() == job.sources[i].key())
+        {
             return Err(NodraError::rejected(
-                format!("{} and {} read the same table, which is the driving source", source_table(i), source_table(j)),
+                format!(
+                    "{} and {} read the same table, which is the driving source",
+                    source_table(i),
+                    source_table(j)
+                ),
                 "a second read of the driving source would see all of its rows on every worker; \
                  refer to it once (aggregate or deduplicate in a separate job)",
             ));
@@ -304,8 +309,7 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
     reject_subqueries_over(&plan, &driving_tables)?;
 
     // ---- class --------------------------------------------------------------------------
-    let has_broadcast_join = roles.contains(&Role::Broadcast)
-        && job.sources.len() > 1;
+    let has_broadcast_join = roles.contains(&Role::Broadcast) && job.sources.len() > 1;
     let (mut class, unit_key) = if large.len() == 2 {
         let join = walk.copartition_join.clone().ok_or_else(|| {
             NodraError::rejected(
@@ -329,9 +333,15 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
         check_partition_local(&plan, &join, &keys, &mut notes)?;
         (JobClass::CoPartitionedJoin, UnitKey::Partition(cols))
     } else if job.stream_source().is_some() {
-        (if has_broadcast_join { JobClass::BroadcastJoin } else { JobClass::PartitionParallel }, UnitKey::StreamPartition)
+        (
+            if has_broadcast_join { JobClass::BroadcastJoin } else { JobClass::PartitionParallel },
+            UnitKey::StreamPartition,
+        )
     } else {
-        (if has_broadcast_join { JobClass::BroadcastJoin } else { JobClass::PartitionParallel }, UnitKey::File)
+        (
+            if has_broadcast_join { JobClass::BroadcastJoin } else { JobClass::PartitionParallel },
+            UnitKey::File,
+        )
     };
 
     let mut merge_scope = None;
@@ -350,14 +360,20 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
             let unique: BTreeSet<&String> = split_group_names.iter().collect();
             if unique.len() != split_group_names.len() {
                 return Err(NodraError::rejected(
-                    format!("the aggregation has several group keys with the same name ({})", split_group_names.join(", ")),
+                    format!(
+                        "the aggregation has several group keys with the same name ({})",
+                        split_group_names.join(", ")
+                    ),
                     "alias them in a subquery so that every group key has its own name",
                 ));
             }
         }
     }
     if class == JobClass::CoPartitionedJoin && job.stream_source().is_some() {
-        return Err(NodraError::rejected("co-partitioned join with a stream", "stream joins need broadcast tables"));
+        return Err(NodraError::rejected(
+            "co-partitioned join with a stream",
+            "stream joins need broadcast tables",
+        ));
     }
     Ok(JobPlan { class, roles, unit_key, output_schema, merge_scope, split_group_names, notes })
 }
@@ -550,7 +566,7 @@ fn secondary_tables(plan: &LogicalPlan) -> BTreeSet<String> {
             }
         }
         let _ = n.apply_subqueries(|sub| {
-            out.extend(tables(&sub));
+            out.extend(tables(sub));
             Ok(TreeNodeRecursion::Continue)
         });
         Ok(TreeNodeRecursion::Continue)
@@ -596,7 +612,10 @@ fn check_partition_local(
                         "group by the partition columns, or write the join result and aggregate it in a second job",
                     ));
                 }
-                notes.push("aggregation groups by the partition columns: each worker finalizes its own partitions".into());
+                notes.push(
+                    "aggregation groups by the partition columns: each worker finalizes its own partitions"
+                        .into(),
+                );
                 &agg.input
             }
             LogicalPlan::Join(j) => {
@@ -699,9 +718,10 @@ fn origin(plan: &LogicalPlan, col: &Column) -> Option<(String, String)> {
             let (q, f) = a.input.schema().qualified_field(i);
             origin(&a.input, &Column::new(q.cloned(), f.name()))
         }
-        LogicalPlan::Filter(_) | LogicalPlan::Sort(_) | LogicalPlan::Limit(_) | LogicalPlan::Repartition(_) => {
-            origin(plan.inputs()[0], col)
-        }
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Repartition(_) => origin(plan.inputs()[0], col),
         LogicalPlan::Join(j) => {
             if j.left.schema().index_of_column(col).is_ok() {
                 origin(&j.left, col)
@@ -753,14 +773,17 @@ fn copartition_columns(
         .on
         .iter()
         .filter_map(|(l, r)| match (l.clone().unalias(), r.clone().unalias()) {
-            (Expr::Column(lc), Expr::Column(rc)) => Some((origin(&join.left, &lc)?, origin(&join.right, &rc)?)),
+            (Expr::Column(lc), Expr::Column(rc)) => {
+                Some((origin(&join.left, &lc)?, origin(&join.right, &rc)?))
+            }
             _ => None,
         })
         .collect();
     let (ta, tb) = (source_table(a), source_table(b));
     for (ca, cb) in pa.iter().zip(pb) {
         let found = pairs.iter().any(|(l, r)| {
-            (l.0 == ta && &l.1 == ca && r.0 == tb && &r.1 == cb) || (l.0 == tb && &l.1 == cb && r.0 == ta && &r.1 == ca)
+            (l.0 == ta && &l.1 == ca && r.0 == tb && &r.1 == cb)
+                || (l.0 == tb && &l.1 == cb && r.0 == ta && &r.1 == ca)
         });
         if !found {
             return Err(reject(&format!("the join does not equate `{ca}` with `{cb}`")));
@@ -851,7 +874,9 @@ pub fn explain(job: &Job, infos: &[SourceInfo], plan: &JobPlan) -> String {
         let role = match (&plan.roles[i], spec.is_stream()) {
             (Role::Driving, true) => "driving · partitions assigned by `partition mod workers`".to_string(),
             (Role::Driving, false) => match &plan.unit_key {
-                UnitKey::Partition(cols) => format!("driving · partitions [{}] assigned by hash", cols.join(", ")),
+                UnitKey::Partition(cols) => {
+                    format!("driving · partitions [{}] assigned by hash", cols.join(", "))
+                }
                 _ => "driving · files assigned by hash".to_string(),
             },
             (Role::Broadcast, _) => "broadcast · loaded by every worker".to_string(),
@@ -923,7 +948,12 @@ mod tests {
 
     fn events(size: u64) -> SourceInfo {
         info(
-            &[("ts", DataType::Int64), ("cid", DataType::Int64), ("v", DataType::Float64), ("day", DataType::Utf8)],
+            &[
+                ("ts", DataType::Int64),
+                ("cid", DataType::Int64),
+                ("v", DataType::Float64),
+                ("day", DataType::Utf8),
+            ],
             &["day"],
             size,
         )
@@ -942,9 +972,12 @@ mod tests {
 
     #[tokio::test]
     async fn class1_filter_projection() {
-        let p = plan("INSERT INTO delta('/o') SELECT cid, v * 2 AS v2 FROM delta('/e') WHERE v > 1", vec![events(BIG)])
-            .await
-            .unwrap();
+        let p = plan(
+            "INSERT INTO delta('/o') SELECT cid, v * 2 AS v2 FROM delta('/e') WHERE v > 1",
+            vec![events(BIG)],
+        )
+        .await
+        .unwrap();
         assert_eq!(p.class, JobClass::PartitionParallel);
         assert_eq!(p.unit_key, UnitKey::File);
         assert_eq!(p.output_schema.fields().len(), 2);
@@ -1019,7 +1052,11 @@ mod tests {
 
     #[tokio::test]
     async fn class4_aggregation_must_group_by_partition() {
-        let other = info(&[("day", DataType::Utf8), ("cid", DataType::Int64), ("w", DataType::Float64)], &["day"], BIG);
+        let other = info(
+            &[("day", DataType::Utf8), ("cid", DataType::Int64), ("w", DataType::Float64)],
+            &["day"],
+            BIG,
+        );
         let p = plan(
             "INSERT INTO delta('/o') SELECT a.day, sum(b.w) AS w FROM delta('/a') a JOIN delta('/b') b ON a.day = b.day GROUP BY a.day",
             vec![events(BIG), other.clone()],
@@ -1051,7 +1088,11 @@ mod tests {
 
     #[tokio::test]
     async fn class4_copartitioned() {
-        let other = info(&[("day", DataType::Utf8), ("cid", DataType::Int64), ("w", DataType::Float64)], &["day"], BIG);
+        let other = info(
+            &[("day", DataType::Utf8), ("cid", DataType::Int64), ("w", DataType::Float64)],
+            &["day"],
+            BIG,
+        );
         let p = plan(
             "INSERT INTO delta('/o') SELECT a.day, a.cid, a.v, b.w FROM delta('/a') a \
              JOIN delta('/b') b ON a.day = b.day AND a.cid = b.cid",
@@ -1112,7 +1153,11 @@ mod tests {
             "INSERT INTO delta('/o') SELECT a.cid FROM delta('/e') a JOIN delta('/e/') b ON a.cid = b.cid",
         ];
         for sql in cases {
-            let infos = if sql.contains("delta('/e/')") { vec![events(BIG), events(1 << 20)] } else { vec![events(BIG)] };
+            let infos = if sql.contains("delta('/e/')") {
+                vec![events(BIG), events(1 << 20)]
+            } else {
+                vec![events(BIG)]
+            };
             let err = plan(sql, infos).await.unwrap_err();
             assert!(matches!(err, NodraError::Rejected(_)), "{sql}: {err}");
         }
@@ -1140,7 +1185,11 @@ mod tests {
 
     #[tokio::test]
     async fn class4_only_partition_local_operators_above_the_join() {
-        let other = info(&[("day", DataType::Utf8), ("cid", DataType::Int64), ("w", DataType::Float64)], &["day"], BIG);
+        let other = info(
+            &[("day", DataType::Utf8), ("cid", DataType::Int64), ("w", DataType::Float64)],
+            &["day"],
+            BIG,
+        );
         for sql in [
             "INSERT INTO delta('/o') SELECT count(*) AS n, sum(s) AS s FROM \
              (SELECT a.day, sum(b.w) AS s FROM delta('/a') a JOIN delta('/b') b ON a.day = b.day GROUP BY a.day)",

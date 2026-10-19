@@ -10,10 +10,10 @@ use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int64Array, Record
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::catalog::MemTable;
-use deltalake_core::operations::create::CreateBuilder;
-use deltalake_core::writer::{DeltaWriter, RecordBatchWriter};
 use deltalake_core::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake_core::kernel::StructType;
+use deltalake_core::operations::create::CreateBuilder;
+use deltalake_core::writer::{DeltaWriter, RecordBatchWriter};
 use nodra::exec::{self, Pipeline};
 use nodra::job::{source_table, Job, SourceSpec};
 use nodra::{delta, session};
@@ -84,7 +84,11 @@ pub fn dim_schema() -> SchemaRef {
 pub fn dim() -> RecordBatch {
     let cid: Vec<i64> = (0..6).collect(); // cid 6 has no brand: tests inner vs left joins
     let brand: Vec<String> = cid.iter().map(|c| format!("brand-{}", c % 3)).collect();
-    RecordBatch::try_new(dim_schema(), vec![Arc::new(Int64Array::from(cid)), Arc::new(StringArray::from(brand))]).unwrap()
+    RecordBatch::try_new(
+        dim_schema(),
+        vec![Arc::new(Int64Array::from(cid)), Arc::new(StringArray::from(brand))],
+    )
+    .unwrap()
 }
 
 /// Events table with `commits` appends of `per` rows each, partitioned by day.
@@ -116,7 +120,8 @@ pub async fn table_rows(location: &str, columns: &[String]) -> Vec<String> {
     let files = delta::active_files(&t).unwrap();
     exec::register_delta(&ctx, 0, &t, None, &files, false).unwrap();
     let cols = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
-    let batches = ctx.sql(&format!("SELECT {cols} FROM {}", source_table(0))).await.unwrap().collect().await.unwrap();
+    let batches =
+        ctx.sql(&format!("SELECT {cols} FROM {}", source_table(0))).await.unwrap().collect().await.unwrap();
     render(&batches)
 }
 
@@ -134,8 +139,11 @@ pub async fn reference(sql: &str, streams: &[RecordBatch]) -> (Vec<String>, Vec<
             }
             _ => {
                 let b = streams[0].clone();
-                ctx.register_table(source_table(i), Arc::new(MemTable::try_new(b.schema(), vec![vec![b]]).unwrap()))
-                    .unwrap();
+                ctx.register_table(
+                    source_table(i),
+                    Arc::new(MemTable::try_new(b.schema(), vec![vec![b]]).unwrap()),
+                )
+                .unwrap();
             }
         }
     }
@@ -228,7 +236,9 @@ pub fn clicks(range: std::ops::Range<i64>) -> (Vec<String>, RecordBatch) {
         vec![
             Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
             Arc::new(Int64Array::from(ids.iter().map(|i| i % 7).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(ids.iter().map(|i| format!("u{}", (i * 13) % 41)).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                ids.iter().map(|i| format!("u{}", (i * 13) % 41)).collect::<Vec<_>>(),
+            )),
         ],
     )
     .unwrap();
@@ -249,7 +259,8 @@ pub async fn compact(path: &Path) -> bool {
     exec::register_delta(&ctx, 0, &table, None, &files, false).unwrap();
     let schema = delta::arrow_schema(&table).unwrap();
     let cols = schema.fields().iter().map(|f| format!("\"{}\"", f.name())).collect::<Vec<_>>().join(", ");
-    let batches = ctx.sql(&format!("SELECT {cols} FROM {}", source_table(0))).await.unwrap().collect().await.unwrap();
+    let batches =
+        ctx.sql(&format!("SELECT {cols} FROM {}", source_table(0))).await.unwrap().collect().await.unwrap();
     let mut w = RecordBatchWriter::for_table(&table).unwrap();
     for b in batches {
         let b = RecordBatch::try_new(schema.clone(), b.columns().to_vec()).unwrap();
@@ -283,7 +294,8 @@ pub async fn delete_one_file(path: &Path) {
     let mut table = delta::open(&loc(path)).await.unwrap();
     let f = table.snapshot().unwrap().log_data().iter().next().unwrap();
     let op = deltalake_core::protocol::DeltaOperation::Delete { predicate: Some("test".into()) };
-    match delta::commit(&mut table, vec![Action::Remove(f.remove_action(true))], vec![], op, 3).await.unwrap() {
+    match delta::commit(&mut table, vec![Action::Remove(f.remove_action(true))], vec![], op, 3).await.unwrap()
+    {
         delta::CommitOutcome::Committed(_) => {}
         other => panic!("{other:?}"),
     }

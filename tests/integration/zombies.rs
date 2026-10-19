@@ -90,7 +90,11 @@ async fn raced_commit_updates_cached_progress() {
 
     let rows = table_rows(&loc(&out), &["id".to_string()]).await;
     let dup: Vec<i64> = [100, 101, 102].into_iter().filter(|i| count_id(&rows, *i) != 1).collect();
-    assert!(dup.is_empty(), "p1 messages {dup:?} written more than once; sink has {} rows, expected 12", rows.len());
+    assert!(
+        dup.is_empty(),
+        "p1 messages {dup:?} written more than once; sink has {} rows, expected 12",
+        rows.len()
+    );
     assert_eq!(rows.len(), 12);
 }
 

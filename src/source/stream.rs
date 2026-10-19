@@ -72,9 +72,8 @@ pub fn decode_json_lenient(
 }
 
 fn decode_all(schema: &SchemaRef, payloads: &[Option<Vec<u8>>]) -> Result<RecordBatch> {
-    let mut decoder = ReaderBuilder::new(schema.clone())
-        .with_batch_size(payloads.len().max(1))
-        .build_decoder()?;
+    let mut decoder =
+        ReaderBuilder::new(schema.clone()).with_batch_size(payloads.len().max(1)).build_decoder()?;
     for p in payloads {
         let Some(p) = p else { continue };
         if p.iter().all(u8::is_ascii_whitespace) {

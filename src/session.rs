@@ -29,11 +29,8 @@ pub fn new_context(settings: &Settings) -> Result<SessionContext> {
     opts.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
     // Keep aggregate group keys in their logical order where possible (see `partial`).
     opts.optimizer.top_down_join_key_reordering = false;
-    let rules = PhysicalOptimizer::new()
-        .rules
-        .into_iter()
-        .filter(|r| r.name() != "aggregate_statistics")
-        .collect();
+    let rules =
+        PhysicalOptimizer::new().rules.into_iter().filter(|r| r.name() != "aggregate_statistics").collect();
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_default_features()

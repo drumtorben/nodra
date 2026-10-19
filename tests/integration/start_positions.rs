@@ -28,7 +28,11 @@ async fn workers_share_one_snapshot_version_around_a_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let (src, out) = (dir.path().join("events"), dir.path().join("out"));
     events_table(&src, 3, 20).await; // 3 commits x 3 day partitions = 9 files
-    let sql = format!("SET nodra.job_name = 'snapv'; INSERT INTO delta('{}') SELECT id, cid FROM delta('{}')", loc(&out), loc(&src));
+    let sql = format!(
+        "SET nodra.job_name = 'snapv'; INSERT INTO delta('{}') SELECT id, cid FROM delta('{}')",
+        loc(&out),
+        loc(&src)
+    );
     run_some(&sql, &[0], 2).await.unwrap(); // worker 0: snapshot at version 3
     assert!(compact(&src).await); // version 4: 3 compacted files, dataChange = false
     run_some(&sql, &[1], 2).await.unwrap(); // worker 1: snapshot at version 4
@@ -51,11 +55,17 @@ async fn zombie_with_other_chunk_size_during_initial_snapshot_conflicts() {
         let base = format!("INSERT INTO delta('{}') SELECT id, v FROM delta('{}')", loc(&out), loc(&src));
         let name = format!("snapzombie{round}");
         let big = Arc::new(
-            Pipeline::prepare(Job::parse(&format!("SET nodra.job_name = '{name}'; {base}"), "x").unwrap()).await.unwrap(),
+            Pipeline::prepare(Job::parse(&format!("SET nodra.job_name = '{name}'; {base}"), "x").unwrap())
+                .await
+                .unwrap(),
         );
         let small = Arc::new(
             Pipeline::prepare(
-                Job::parse(&format!("SET nodra.job_name = '{name}'; SET nodra.max_files_per_batch = '2'; {base}"), "x").unwrap(),
+                Job::parse(
+                    &format!("SET nodra.job_name = '{name}'; SET nodra.max_files_per_batch = '2'; {base}"),
+                    "x",
+                )
+                .unwrap(),
             )
             .await
             .unwrap(),

@@ -29,11 +29,11 @@ use tracing::{debug, info, warn};
 use crate::delta::{self, CommitOutcome, DataFile};
 use crate::error::{NodraError, Result};
 use crate::hash::{fnv1a64, worker_for};
-use crate::rescale;
 use crate::job::{source_table, Job, SinkMode, SourceSpec};
 use crate::metrics::{self, WorkerMetrics};
 use crate::partial;
 use crate::planner::{self, JobClass, JobPlan, Role, SourceInfo, UnitKey};
+use crate::rescale;
 use crate::scan::FileListTable;
 use crate::session;
 use crate::settings::StartPosition;
@@ -148,7 +148,8 @@ impl Pipeline {
         let plan = planner::plan_job_with(&job, &infos, previous).await?;
         let sink_schema = types::delta_schema(&plan.output_schema)?;
         if matches!(job.sink, crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. })
-            && (job.stream_source().is_some() || plan.class != JobClass::PartitionParallel && plan.class != JobClass::BroadcastJoin)
+            && (job.stream_source().is_some()
+                || plan.class != JobClass::PartitionParallel && plan.class != JobClass::BroadcastJoin)
         {
             return Err(NodraError::job(
                 "mode => 'overwrite' is only supported for class-1/2 jobs over Delta sources",
@@ -325,7 +326,12 @@ enum Step {
 }
 
 /// Run one worker until `stop` (or, with `once`, until it is caught up).
-pub async fn run_worker(p: Arc<Pipeline>, id: WorkerId, once: bool, mut stop: watch::Receiver<bool>) -> Result<()> {
+pub async fn run_worker(
+    p: Arc<Pipeline>,
+    id: WorkerId,
+    once: bool,
+    mut stop: watch::Receiver<bool>,
+) -> Result<()> {
     let mut w = Worker::new(p.clone(), id).await?;
     let trigger = p.job.settings.trigger()?;
     let merge_interval = p.job.settings.merge_interval()?;
@@ -421,12 +427,19 @@ impl Worker {
                 let src: StreamRef = match &p.job.sources[i] {
                     SourceSpec::JsonlStream { dir, .. } => Arc::new(JsonlStream::new(dir)?),
                     #[cfg(feature = "kafka")]
-                    SourceSpec::Kafka { topic, brokers, properties, .. } => Arc::new(
-                        crate::source::kafka::KafkaSource::new(topic, brokers, &format!("nodra-{}", p.job.name), properties)?,
-                    ),
+                    SourceSpec::Kafka { topic, brokers, properties, .. } => {
+                        Arc::new(crate::source::kafka::KafkaSource::new(
+                            topic,
+                            brokers,
+                            &format!("nodra-{}", p.job.name),
+                            properties,
+                        )?)
+                    }
                     #[cfg(not(feature = "kafka"))]
                     SourceSpec::Kafka { .. } => {
-                        return Err(NodraError::config("this build of nodra has no Kafka support (feature `kafka`)"))
+                        return Err(NodraError::config(
+                            "this build of nodra has no Kafka support (feature `kafka`)",
+                        ))
                     }
                     SourceSpec::Delta { .. } => unreachable!(),
                 };
@@ -558,7 +571,9 @@ impl Worker {
         let mut fence = Vec::new();
         if let (None, Some(h)) = (committed, &handover) {
             let started = self.all_txns.as_ref().is_some_and(|all| {
-                rescale::generations(all, &prefix).map(|g| g.contains_key(&placement.generation)).unwrap_or(false)
+                rescale::generations(all, &prefix)
+                    .map(|g| g.contains_key(&placement.generation))
+                    .unwrap_or(false)
             });
             for j in 0..h.count {
                 let key = rescale::worker_key(&prefix, h.generation, j, h.count);
@@ -620,10 +635,8 @@ impl Worker {
                 };
                 let snap = delta::open_version(uri, snap_version).await?;
                 self.check_source_schema(di, &snap)?;
-                let mut files: Vec<DataFile> = delta::active_files(&snap)?
-                    .into_iter()
-                    .filter(|f| self.owns_file(f))
-                    .collect();
+                let mut files: Vec<DataFile> =
+                    delta::active_files(&snap)?.into_iter().filter(|f| self.owns_file(f)).collect();
                 files.sort_by(|a, b| a.path.as_ref().cmp(b.path.as_ref()));
                 // `done` counts files (not chunks), so changing max_files_per_batch between runs
                 // neither skips nor repeats files.
@@ -633,7 +646,8 @@ impl Worker {
                 let last = done_after >= total;
                 // Every snapshot commit writes the snapshot key, so two replicas of a worker that
                 // chunk differently still conflict with each other.
-                let mut txns = vec![Progress::new(&b_key, encode_snapshot(snap_version, done_after)?, b_committed)];
+                let mut txns =
+                    vec![Progress::new(&b_key, encode_snapshot(snap_version, done_after)?, b_committed)];
                 if last {
                     txns.push(Progress::new(&a_key, snap_version, None));
                 }
@@ -647,7 +661,8 @@ impl Worker {
             }
             Some(prog) if prog < latest => {
                 let end = latest.min(prog + 1000);
-                let changes = delta::changes(&src, &layout.partition_columns(), prog as u64, end as u64).await?;
+                let changes =
+                    delta::changes(&src, &layout.partition_columns(), prog as u64, end as u64).await?;
                 let ignore_changes = p.job.settings.ignore_changes()?;
                 let mut files = Vec::new();
                 let mut v_end = prog;
@@ -667,7 +682,8 @@ impl Worker {
                     }
                     let v = c.version as i64;
                     files.extend(c.adds.into_iter().filter(|f| {
-                        self.owns_file(f) && !handover.as_ref().is_some_and(|h| h.processed(f.path.as_ref(), v))
+                        self.owns_file(f)
+                            && !handover.as_ref().is_some_and(|h| h.processed(f.path.as_ref(), v))
                     }));
                     v_end = v;
                     if files.len() >= max_files {
@@ -714,7 +730,13 @@ impl Worker {
 
     /// `mode => 'overwrite'`: recompute the sink from the complete current source snapshot in
     /// one batch (no progress tracking; single worker, `--once`).
-    async fn step_overwrite(&mut self, target: Option<DeltaTable>, di: usize, uri: &str, pinned: Option<i64>) -> Result<Step> {
+    async fn step_overwrite(
+        &mut self,
+        target: Option<DeltaTable>,
+        di: usize,
+        uri: &str,
+        pinned: Option<i64>,
+    ) -> Result<Step> {
         if self.cursor.is_some() {
             return Ok(Step::Idle);
         }
@@ -803,8 +825,11 @@ impl Worker {
         let max = self.p.job.settings.max_records_per_partition()?;
         let skip_bad = self.p.job.settings.skip_bad_messages()?;
         let all_parts = src.partitions().await?;
-        let parts: Vec<i32> =
-            all_parts.iter().copied().filter(|p| (p.rem_euclid(self.id.count as i32)) as u32 == self.id.index).collect();
+        let parts: Vec<i32> = all_parts
+            .iter()
+            .copied()
+            .filter(|p| (p.rem_euclid(self.id.count as i32)) as u32 == self.id.index)
+            .collect();
         if parts.is_empty() {
             return Ok(Step::Idle);
         }
@@ -828,7 +853,8 @@ impl Worker {
             if let (Some(t), None) = (&target, &self.all_txns) {
                 self.all_txns = Some(delta::txn_map(t).await?);
             }
-            let recorded = rescale::stream_starts(self.all_txns.as_ref().filter(|_| target.is_some()), &prefix);
+            let recorded =
+                rescale::stream_starts(self.all_txns.as_ref().filter(|_| target.is_some()), &prefix);
             if recorded.is_empty() {
                 first_start = true;
                 for &part in &all_parts {
@@ -867,7 +893,11 @@ impl Worker {
             }
             let fetched = src.fetch(part, from, high, max).await?;
             if fetched.next_offset > from {
-                let ctx = format!("{} partition {part} offsets {from}..{}", self.p.job.sources[si].describe(), fetched.next_offset);
+                let ctx = format!(
+                    "{} partition {part} offsets {from}..{}",
+                    self.p.job.sources[si].describe(),
+                    fetched.next_offset
+                );
                 if skip_bad {
                     let (batch, bad) = decode_json_lenient(&schema, &fetched.payloads)?;
                     for (i, e) in bad.iter().take(3) {
@@ -934,18 +964,15 @@ impl Worker {
                 continue;
             }
             let fingerprint = partition_fingerprint(&files);
-            match self.progress(&target, &p.partition_progress_key(&key)).await? {
-                Some(done) => {
-                    if done != fingerprint && self.changed_partitions.insert(key.clone()) {
-                        warn!(
-                            worker = self.id.index,
-                            partition = %key,
-                            "partition changed after it was processed; class-4 jobs process every partition once, the change is ignored"
-                        );
-                    }
-                    continue;
+            if let Some(done) = self.progress(&target, &p.partition_progress_key(&key)).await? {
+                if done != fingerprint && self.changed_partitions.insert(key.clone()) {
+                    warn!(
+                        worker = self.id.index,
+                        partition = %key,
+                        "partition changed after it was processed; class-4 jobs process every partition once, the change is ignored"
+                    );
                 }
-                None => {}
+                continue;
             }
             pending += 1;
             if nfiles < max_files {
@@ -958,7 +985,8 @@ impl Worker {
             return Ok(Step::Idle);
         }
         let more = pending > chosen.len();
-        let txns = chosen.iter().map(|(k, _, fp)| Progress::new(p.partition_progress_key(k), *fp, None)).collect();
+        let txns =
+            chosen.iter().map(|(k, _, fp)| Progress::new(p.partition_progress_key(k), *fp, None)).collect();
         let mut inputs = Vec::new();
         for (slot, (&di, t)) in driving.iter().zip(tables).enumerate() {
             let files = chosen.iter().flat_map(|(_, f, _)| f[slot].clone()).collect();
@@ -973,7 +1001,12 @@ impl Worker {
 
     // ---------------------------------------------------------------- shared ---------------
 
-    async fn commit_progress_only(&mut self, target: Option<DeltaTable>, progress: Vec<Progress>, more: bool) -> Result<Step> {
+    async fn commit_progress_only(
+        &mut self,
+        target: Option<DeltaTable>,
+        progress: Vec<Progress>,
+        more: bool,
+    ) -> Result<Step> {
         let target = match target {
             Some(t) => t,
             None => match self.open_new_target(None, &progress).await? {
@@ -1037,7 +1070,10 @@ impl Worker {
                     return Ok(None);
                 }
                 CommitOutcome::Retry(why) => {
-                    warn!(worker = self.id.index, attempt, "commit conflicts with a concurrent change ({why}); retrying");
+                    warn!(
+                        worker = self.id.index,
+                        attempt, "commit conflicts with a concurrent change ({why}); retrying"
+                    );
                     self.metrics.commit_retries.fetch_add(1, Ordering::Relaxed);
                 }
                 CommitOutcome::Stale => {
@@ -1060,7 +1096,11 @@ impl Worker {
     /// been created concurrently, possibly with commits for our input, so it becomes the read
     /// snapshot and the batch's progress is re-verified against it. `None`: another process
     /// already committed progress for this input.
-    async fn open_new_target(&mut self, state_schema: Option<SchemaRef>, progress: &[Progress]) -> Result<Option<DeltaTable>> {
+    async fn open_new_target(
+        &mut self,
+        state_schema: Option<SchemaRef>,
+        progress: &[Progress],
+    ) -> Result<Option<DeltaTable>> {
         let t = self.create_target(state_schema).await?;
         self.adopt(&t).await?;
         if self.verify(&t, progress).await? {
@@ -1098,7 +1138,12 @@ impl Worker {
         Ok(schema)
     }
 
-    async fn process(&mut self, target: Option<DeltaTable>, input: Input, progress: Vec<Progress>) -> Result<Step> {
+    async fn process(
+        &mut self,
+        target: Option<DeltaTable>,
+        input: Input,
+        progress: Vec<Progress>,
+    ) -> Result<Step> {
         let p = self.p.clone();
         let ctx = session::new_context(&p.job.settings)?;
         let mut rows_in = 0u64;
@@ -1115,7 +1160,10 @@ impl Worker {
                 let (si, _, schema) = self.stream.clone().expect("stream");
                 let marked = partial::mark_driving(&schema);
                 let batch = batch.with_schema(marked.clone())?;
-                ctx.register_table(source_table(si), Arc::new(MemTable::try_new(marked, vec![vec![batch]])?))?;
+                ctx.register_table(
+                    source_table(si),
+                    Arc::new(MemTable::try_new(marked, vec![vec![batch]])?),
+                )?;
                 register_broadcast(&ctx, &p, &BTreeSet::from([si])).await?;
             }
         }
@@ -1163,7 +1211,13 @@ impl Worker {
                 self.metrics.files_written.fetch_add(nfiles as u64, Ordering::Relaxed);
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
                 self.metrics.last_commit_unix.store(now, Ordering::Relaxed);
-                info!(worker = self.id.index, version = v, rows = rows_out, files = nfiles, "batch committed");
+                info!(
+                    worker = self.id.index,
+                    version = v,
+                    rows = rows_out,
+                    files = nfiles,
+                    "batch committed"
+                );
                 Ok(Step::Processed { more: false })
             }
             None => {

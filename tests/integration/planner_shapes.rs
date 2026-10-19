@@ -97,16 +97,36 @@ async fn class3_pruned_workers_and_typed_scoped_merges() {
     typed_table_chunks(&t, 0..2).await;
     let jobs: Vec<String> = [
         ("none", "", "SELECT n, count(*) AS k FROM {T} WHERE d = DATE '2025-10-08' GROUP BY n"),
-        ("global_some", "", "SELECT count(*) AS k, sum(id) AS s, min(ts) AS first FROM {T} WHERE s = 'plain' AND n = 1"),
+        (
+            "global_some",
+            "",
+            "SELECT count(*) AS k, sum(id) AS s, min(ts) AS first FROM {T} WHERE s = 'plain' AND n = 1",
+        ),
         ("global_none", "", "SELECT count(*) AS k, sum(id) AS s FROM {T} WHERE s = 'nope'"),
-        ("by_date", ", partition_by => 'd'", "SELECT d, count(*) AS k, max(s) AS ms FROM {T} WHERE b IS NOT NULL GROUP BY d"),
-        ("by_int_bool", ", partition_by => 'n, b'", "SELECT n, b, count(DISTINCT s) AS ds FROM {T} GROUP BY n, b"),
+        (
+            "by_date",
+            ", partition_by => 'd'",
+            "SELECT d, count(*) AS k, max(s) AS ms FROM {T} WHERE b IS NOT NULL GROUP BY d",
+        ),
+        (
+            "by_int_bool",
+            ", partition_by => 'n, b'",
+            "SELECT n, b, count(DISTINCT s) AS ds FROM {T} GROUP BY n, b",
+        ),
         ("by_ts", ", partition_by => 'ts'", "SELECT ts, sum(id) AS s FROM {T} WHERE s <> 'x=y' GROUP BY ts"),
-        ("by_str", ", partition_by => 's'", "SELECT s, count(*) AS k FROM {T} GROUP BY s HAVING count(*) > 1"),
+        (
+            "by_str",
+            ", partition_by => 's'",
+            "SELECT s, count(*) AS k FROM {T} GROUP BY s HAVING count(*) > 1",
+        ),
     ]
     .iter()
     .map(|(name, sink, body)| {
-        format!("INSERT INTO delta('{}'{sink}) {}", loc(&dir.path().join(name)), body.replace("{T}", &format!("delta('{}')", loc(&t))))
+        format!(
+            "INSERT INTO delta('{}'{sink}) {}",
+            loc(&dir.path().join(name)),
+            body.replace("{T}", &format!("delta('{}')", loc(&t)))
+        )
     })
     .collect();
     let mut bad = Vec::new();

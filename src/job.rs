@@ -14,8 +14,8 @@ use std::ops::ControlFlow;
 use std::path::Path;
 
 use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, Statement, TableFactor, UnaryOperator,
-    Value, VisitMut, VisitorMut,
+    Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, Statement, TableFactor, UnaryOperator, Value,
+    VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -119,9 +119,10 @@ impl Call {
     fn opt_i64(&self, name: &str) -> Result<Option<i64>> {
         match self.named.get(name) {
             None => Ok(None),
-            Some(Lit::Num(n)) => n.parse().map(Some).map_err(|_| {
-                NodraError::job(format!("{}(): `{name}` must be an integer", self.function))
-            }),
+            Some(Lit::Num(n)) => n
+                .parse()
+                .map(Some)
+                .map_err(|_| NodraError::job(format!("{}(): `{name}` must be an integer", self.function))),
             Some(other) => Err(NodraError::job(format!(
                 "{}(): `{name}` must be an integer, got {}",
                 self.function,
@@ -263,10 +264,8 @@ impl Job {
     pub fn from_file(path: &Path) -> Result<Job> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| NodraError::job(format!("cannot read {}: {e}", path.display())))?;
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "job".to_string());
+        let stem =
+            path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "job".to_string());
         Job::parse(&text, &stem)
     }
 
@@ -296,7 +295,9 @@ impl Job {
         let sink = sink_from_call(&parse_call(&sink_call)?)?;
         let (query, sources) = rewrite_query(&query_text)?;
         if sources.is_empty() {
-            return Err(NodraError::job("the query reads no source (use delta(), kafka() or jsonl_stream())"));
+            return Err(NodraError::job(
+                "the query reads no source (use delta(), kafka() or jsonl_stream())",
+            ));
         }
         if sources.iter().filter(|s| s.is_stream()).count() > 1 {
             return Err(NodraError::rejected(
@@ -316,9 +317,7 @@ impl Job {
 }
 
 fn validate_job_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
         return Err(NodraError::job(format!(
             "invalid job name `{name}` (use letters, digits, `_`, `-`, `.`)"
         )));
@@ -430,9 +429,8 @@ fn split_insert(stmt: &str) -> Result<(String, String)> {
         })
         .ok_or_else(|| NodraError::job("expected `INSERT INTO <sink>(...) <query>`"))?;
     let rest = &stmt[rest_start..];
-    let open = rest
-        .find('(')
-        .ok_or_else(|| NodraError::job("the sink must be a call such as delta('/path')"))?;
+    let open =
+        rest.find('(').ok_or_else(|| NodraError::job("the sink must be a call such as delta('/path')"))?;
     let name = rest[..open].trim();
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(NodraError::job(format!(
@@ -534,9 +532,7 @@ fn call_from_args(name: &ObjectName, args: &[FunctionArg]) -> Result<Call> {
                     return Err(NodraError::job(format!("{function}(): duplicate argument `{key}`")));
                 }
             }
-            other => {
-                return Err(NodraError::job(format!("{function}(): unsupported argument `{other}`")))
-            }
+            other => return Err(NodraError::job(format!("{function}(): unsupported argument `{other}`"))),
         }
     }
     Ok(call)
@@ -556,9 +552,7 @@ fn lit(e: &Expr, function: &str) -> Result<Lit> {
         },
         Expr::Identifier(id) if id.value.eq_ignore_ascii_case("true") => Ok(Lit::Bool(true)),
         Expr::Identifier(id) if id.value.eq_ignore_ascii_case("false") => Ok(Lit::Bool(false)),
-        _ => Err(NodraError::job(format!(
-            "{function}(): arguments must be literals, got `{e}`"
-        ))),
+        _ => Err(NodraError::job(format!("{function}(): arguments must be literals, got `{e}`"))),
     }
 }
 
@@ -569,12 +563,7 @@ fn sink_from_call(c: &Call) -> Result<SinkSpec> {
             let uri = c.str_pos(0, "table location")?;
             let partition_by = c
                 .opt_str("partition_by")?
-                .map(|s| {
-                    s.split(',')
-                        .map(|p| p.trim().to_string())
-                        .filter(|p| !p.is_empty())
-                        .collect()
-                })
+                .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
                 .unwrap_or_default();
             let mode = match c.opt_str("mode")?.as_deref().map(str::to_ascii_lowercase).as_deref() {
                 None | Some("append") => SinkMode::Append,
@@ -730,7 +719,11 @@ fn normalize_path(path: &std::path::Path) -> String {
         }
     }
     let s = out.to_string_lossy().to_string();
-    if s.len() > 1 { s.trim_end_matches('/').to_string() } else { s }
+    if s.len() > 1 {
+        s.trim_end_matches('/').to_string()
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]
@@ -798,8 +791,11 @@ mod tests {
         assert!(Job::parse("INSERT INTO delta('/o') SELECT 1", "j").is_err());
         assert!(Job::parse("INSERT INTO nope('/o') SELECT * FROM delta('/x')", "j").is_err());
         assert!(Job::parse("INSERT INTO delta('/o') SELECT * FROM foo('/x')", "j").is_err());
-        assert!(Job::parse("SET nodra.bogus = 1; INSERT INTO delta('/o') SELECT * FROM delta('/x')", "j").is_err());
-        assert!(Job::parse("INSERT INTO delta('/o', speed => 'fast') SELECT * FROM delta('/x')", "j").is_err());
+        assert!(Job::parse("SET nodra.bogus = 1; INSERT INTO delta('/o') SELECT * FROM delta('/x')", "j")
+            .is_err());
+        assert!(
+            Job::parse("INSERT INTO delta('/o', speed => 'fast') SELECT * FROM delta('/x')", "j").is_err()
+        );
         let two_streams = "INSERT INTO delta('/o') SELECT * FROM jsonl_stream('/a', schema => 'x INT') a \
                            JOIN jsonl_stream('/b', schema => 'x INT') b ON a.x = b.x";
         assert!(matches!(Job::parse(two_streams, "j"), Err(NodraError::Rejected(_))));

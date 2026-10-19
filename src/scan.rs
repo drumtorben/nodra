@@ -101,7 +101,8 @@ impl FileListTable {
             .collect::<DfResult<_>>()?;
         let Some(predicate) = conjunction(applicable) else { return Ok(self.files.clone()) };
         let schema = Arc::new(Schema::new(self.partition_fields.clone()));
-        let predicate = state.create_physical_expr(predicate, &DFSchema::try_from(schema.as_ref().clone())?)?;
+        let predicate =
+            state.create_physical_expr(predicate, &DFSchema::try_from(schema.as_ref().clone())?)?;
         // One row per file, one column per partition column.
         let columns = (0..self.partition_fields.len())
             .map(|i| ScalarValue::iter_to_array(self.files.iter().map(|f| f.partition_values[i].clone())))
@@ -234,7 +235,8 @@ mod tests {
             let props = WriterProperties::builder().set_max_row_group_row_count(Some(10)).build();
             let mut w = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
             let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(0..100))]).unwrap();
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(0..100))])
+                    .unwrap();
             w.write(&batch).unwrap();
             w.close().unwrap();
             let size = std::fs::metadata(dir.path().join(&rel)).unwrap().len();
@@ -247,7 +249,10 @@ mod tests {
         }
         let ctx = SessionContext::new();
         let url = ObjectStoreUrl::parse("nodra://t").unwrap();
-        ctx.register_object_store(url.as_ref(), Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()));
+        ctx.register_object_store(
+            url.as_ref(),
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+        );
         let day = Arc::new(Field::new("day", DataType::Utf8, true));
         let table = FileListTable::try_new(schema, vec![day], url, &files).unwrap();
         ctx.register_table("t", Arc::new(table)).unwrap();
@@ -261,9 +266,10 @@ mod tests {
 
         // The other partition's file is not scanned at all; the predicate reached the Parquet
         // scan, which skipped 9 of the 10 row groups of the remaining file.
-        let metrics = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref())
-            .indent(true)
-            .to_string();
+        let metrics =
+            datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref())
+                .indent(true)
+                .to_string();
         assert!(!metrics.contains("day=2026-01-01/part.parquet"), "{metrics}");
         assert!(metrics.contains("predicate="), "{metrics}");
         assert!(metrics.contains("row_groups_pruned_statistics=10 total → 1 matched"), "{metrics}");

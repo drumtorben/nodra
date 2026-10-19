@@ -22,7 +22,11 @@ async fn crash_before_commit_does_not_duplicate() {
                 loc(&src)
             )
         } else {
-            format!("SET nodra.job_name = '{name}'; INSERT INTO delta('{}') SELECT id, v FROM delta('{}')", loc(&out), loc(&src))
+            format!(
+                "SET nodra.job_name = '{name}'; INSERT INTO delta('{}') SELECT id, v FROM delta('{}')",
+                loc(&out),
+                loc(&src)
+            )
         };
         exec::testing::fail_before_commit(&name, 1);
         let err = run_once(&sql, 1).await.unwrap_err();
@@ -51,7 +55,8 @@ async fn zombie_replicas_of_a_worker_never_duplicate() {
             loc(&out),
             loc(&src)
         );
-        let p = Arc::new(Pipeline::prepare(Job::parse(&sql, &format!("zombie{round}")).unwrap()).await.unwrap());
+        let p =
+            Arc::new(Pipeline::prepare(Job::parse(&sql, &format!("zombie{round}")).unwrap()).await.unwrap());
         let (_tx, rx) = watch::channel(false);
         let id = WorkerId { index: 0, count: 1 };
         let a = tokio::spawn(exec::run_worker(p.clone(), id, true, rx.clone()));
@@ -107,10 +112,18 @@ async fn source_schema_change_stops_the_job() {
     let mut table = nodra::delta::open(&loc(&src)).await.unwrap();
     let b = events(10..12);
     let mut fields: Vec<_> = b.schema().fields().iter().cloned().collect();
-    fields.push(Arc::new(datafusion::arrow::datatypes::Field::new("extra", datafusion::arrow::datatypes::DataType::Utf8, true)));
+    fields.push(Arc::new(datafusion::arrow::datatypes::Field::new(
+        "extra",
+        datafusion::arrow::datatypes::DataType::Utf8,
+        true,
+    )));
     let mut cols = b.columns().to_vec();
     cols.push(Arc::new(datafusion::arrow::array::StringArray::from(vec![Some("x"), None])));
-    let b2 = datafusion::arrow::array::RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), cols).unwrap();
+    let b2 = datafusion::arrow::array::RecordBatch::try_new(
+        Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
+        cols,
+    )
+    .unwrap();
     let mut w = RecordBatchWriter::for_table(&table).unwrap();
     w.write_with_mode(b2, WriteMode::MergeSchema).await.unwrap();
     w.flush_and_commit(&mut table).await.unwrap();

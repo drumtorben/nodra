@@ -15,9 +15,13 @@ async fn existing_sink_with_other_column_order_is_written_by_name() {
     events_table(&src, 1, 20).await;
     // The sink exists with the same columns in another order (e.g. created by an earlier
     // version of the job that selected `b, a`).
-    let sink = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true), Field::new("a", DataType::Int64, true)]));
+    let sink = Arc::new(Schema::new(vec![
+        Field::new("b", DataType::Int64, true),
+        Field::new("a", DataType::Int64, true),
+    ]));
     create_table(&out, &sink, &[]).await;
-    let sql = format!("INSERT INTO delta('{}') SELECT id AS a, cid AS b FROM delta('{}')", loc(&out), loc(&src));
+    let sql =
+        format!("INSERT INTO delta('{}') SELECT id AS a, cid AS b FROM delta('{}')", loc(&out), loc(&src));
     run_once(&sql, 1).await.unwrap();
     assert_matches_reference(&sql, &[]).await;
 }
