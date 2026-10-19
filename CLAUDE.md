@@ -20,6 +20,7 @@ cargo build --features azure,kafka-ssl        # what production images use (see 
 cargo test                                    # unit + integration tests, no external services
 cargo test --features azure,kafka-ssl         # also Azure URL/credential and Kafka mock-cluster tests
 cargo test --test integration rescale::       # one group of integration tests (module path)
+NODRA_TEST_KAFKA=localhost:9092 cargo test --features kafka --test integration kafka::  # + real-broker tests
 cargo test --lib planner                      # unit tests of one module
 cargo fmt && cargo clippy --all-targets --features azure,kafka-ssl -- -D warnings
 cargo run --example demo_data -- /tmp/nodra-demo && cargo run -- plan examples/jobs/daily_brand_stats.sql
