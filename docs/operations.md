@@ -74,15 +74,30 @@ every 100 commits and cleans up expired log files on roughly every 100th commit.
 Do not delete or rewrite rows of a source table that a Nodra job reads incrementally unless the
 job runs with `nodra.ignore_changes = true`.
 
+`OPTIMIZE` on a class-3 sink while the merge step runs is safe: the merge recomputes its
+`remove` actions if the sink changed under it. An `OPTIMIZE` that loses such a race fails and
+can simply be repeated.
+
 ## Rescaling
 
-* Stream sources: progress is per partition — change `--workers` at any time.
-* Delta driving sources: progress is per worker, so a different worker count is refused. To
-  rescale, stop all workers once `nodra status` shows the same source version for all of them,
-  and start the new set under a new `nodra.job_name` with `nodra.start = 'latest'`.
+* **Stream sources and class-4 jobs:** progress is per partition — change `--workers` at any
+  time, also during a rolling update.
+* **Delta driving sources:** progress is per worker. To change the worker count, stop all
+  workers, then start the new set with the new `--workers` (in Kubernetes: scale the StatefulSet
+  to 0, change `--workers` and `replicas`, scale up). The new workers take over exactly where
+  each old worker stopped (see [design](design.md#5-rescaling)).
+  * Every old worker must have committed progress; `nodra status` lists the workers of each
+    generation. A worker that is still processing its initial snapshot blocks the rescale.
+  * Do not overlap old and new workers. If an old worker keeps running anyway, new workers
+    refuse to start while its progress moves, and the old worker stops (with an error) at its
+    next commit or within five minutes.
+  * Rescaling back to an earlier worker count works the same way.
 
 ## Changing a job
 
 Progress keys contain the job name and source locations. Changing the query keeps the progress
 (new logic applies to new data only); renaming the job or a source location starts from scratch.
-If the source schema changes, workers stop and must be restarted, which re-plans the job.
+The sink's columns are matched by name, so reordering output columns is fine; adding, removing
+or retyping columns is not (no schema evolution yet). If a source schema changes, workers stop
+and must be restarted, which re-plans the job. The driving source of a job never changes once
+it has run; `nodra plan` notes it.

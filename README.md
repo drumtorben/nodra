@@ -13,14 +13,15 @@ between partitions: ingest, filtering, enrichment with dimension tables, time-bu
 aggregations. Nodra runs exactly those, as a single binary per worker, and tells you when a job
 needs a real shuffle engine.
 
-> Status: **v0.1, early**. The execution model, exactly-once handling and all job classes are
-> implemented and tested (55 tests, including crash, zombie-replica and differential tests).
-> It has not run in production yet. See [Limitations](#limitations).
+> Status: **v0.1, early**. The execution model, exactly-once handling, rescaling and all job
+> classes are implemented and tested (TESTCOUNT tests: crash, zombie-replica, rescaling,
+> concurrent-maintenance and differential tests against single-node DataFusion runs). It has not
+> run in production yet. See [Limitations](#limitations).
 
 ## Quickstart
 
 ```sh
-cargo build --release                        # add --features kafka,azure as needed
+cargo build --release                        # add --features azure,kafka-ssl as needed
 cargo run --release --example demo_data -- /tmp/nodra-demo
 
 ./target/release/nodra plan examples/jobs/daily_brand_stats.sql
@@ -94,7 +95,8 @@ Class 3 works for every DataFusion aggregate with mergeable state: `count`, `sum
 
 * **Assignment is a pure function.** Stream partition `p` belongs to worker `p mod N`; a Delta
   file to worker `fnv1a(path) mod N`. Workers never talk to each other. In Kubernetes the worker
-  index is the StatefulSet ordinal (`--worker auto`).
+  index is the StatefulSet ordinal (`--worker auto`). Changing `N` hands over exactly where
+  every worker stopped.
 * **Exactly-once.** Data files and the new progress (Delta `txn` actions, e.g. the next Kafka
   offset per partition) are committed in one Delta commit. A crash before the commit loses only
   uncommitted files (cleaned up by `VACUUM`); a restarted worker resumes after the last commit.
@@ -135,19 +137,24 @@ v0.1 deliberately does less than it eventually should:
   version 7 limited to appendOnly/timestampNtz/v2Checkpoint/deletionVectors/... features (tables
   Nodra creates are fine).
 * **Sink schema** must match the query output exactly; no schema evolution yet.
-* **Stream formats:** JSON only (no Avro / schema registry yet). Kafka needs the `kafka` feature.
-* **Rescaling** a *Delta-driven* job (changing `--workers`) is refused; stream jobs rescale freely.
+* **Stream formats:** JSON only (no Avro / schema registry yet). Kafka needs the `kafka` (or
+  `kafka-ssl`) feature and has been tested against configuration only, not a live broker.
+* **Rescaling** a *Delta-driven* job needs all old workers stopped (stream jobs rescale freely,
+  also during rolling updates).
 * **Class 4** processes each partition once; data arriving later in an already processed
-  partition is ignored.
+  partition is ignored (with a warning).
+* **Broadcast tables** are read as of each batch; rows processed earlier are not revisited when
+  a dimension table changes (like Spark's stream–static joins).
 * **Partial states are never compacted** yet (DataFusion's `PartialReduce` mode makes this
   possible); with partition-scoped merges this matters only for partitions that keep changing.
-* No filter pushdown into the Parquet scan yet; broadcast tables are reloaded every batch.
+* Broadcast tables are reloaded every batch; Delta file statistics are not used for pruning
+  yet (partition values and Parquet statistics are).
 
 ## Development
 
 ```sh
-cargo test                       # unit + integration tests (no external services needed)
-cargo test --features kafka      # compiles the Kafka source (tests use jsonl_stream)
+cargo test                               # unit + integration tests (no external services)
+cargo test --features azure,kafka-ssl    # also compiles the Azure store and the Kafka source
 ```
 
 `jsonl_stream('<dir>')` is a broker-free stand-in for Kafka (one file per partition, one

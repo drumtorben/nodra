@@ -21,7 +21,8 @@ arguments use `name => value`.
 A Delta table: a local path or a URL (`abfss://container@account.dfs.core.windows.net/path`
 with the `azure` feature).
 
-* As the **driving source**, files are split across workers. The first run processes the
+* As the **driving source**, files are split across workers. The planner picks the largest
+  table that can be split (see `nodra plan`) and keeps that choice once the job has run. The first run processes the
   table's current snapshot (in chunks of `nodra.max_files_per_batch` files), later runs process
   the commits since the last run. Partition columns are exposed after the data columns.
 * As a **broadcast source**, every worker loads the latest snapshot in every batch. A table is
@@ -34,8 +35,9 @@ Not supported: deletion vectors, column mapping, absolute file paths (shallow cl
 
 ### `kafka(topic, brokers => '…', schema => '…' [, format => 'json'] [, "<librdkafka.property>" => '…'])`
 
-Requires the `kafka` cargo feature. Partitions are assigned to workers with `partition mod
-workers`; offsets are stored in the sink's Delta log, not in Kafka. `schema` declares the
+Requires the `kafka` cargo feature (`kafka-ssl` for TLS and SASL, e.g. Azure Event Hubs).
+Partitions are assigned to workers with `partition mod workers`; offsets are stored in the
+sink's Delta log, not in Kafka. `schema` declares the
 columns read from each JSON message, e.g. `'ts TIMESTAMP, campaign_id BIGINT, user_id VARCHAR'`.
 Unknown fields are ignored, missing ones are NULL. Any argument whose name contains a dot is
 passed to librdkafka, e.g. `"security.protocol" => 'SASL_SSL'`.
@@ -91,7 +93,8 @@ to (the sink, or the partials table for class 3). `nodra status` prints them.
 | Key | Version |
 | --- | --- |
 | `nodra/<job>/<source>/w<i>of<n>` | last processed source version (Delta driving source) |
-| `nodra/<job>/<source>/w<i>of<n>/snapshot` | snapshot chunk progress during the first run |
+| `nodra/<job>/<source>/g<g>/w<i>of<n>` | the same, after the worker count changed (generation `g`) |
+| `<worker key>/snapshot` | snapshot version and files done during the first run |
 | `nodra/<job>/<source>/p<partition>` | next offset to read (stream) |
-| `nodra/<job>/part/<hash>` | 1 = partition processed (class 4) |
+| `nodra/<job>/part/<hash>` | fingerprint of a processed partition's files (class 4) |
 | `nodra/<job>/merge` | partials-table version merged (class 3, in the sink) |
