@@ -36,13 +36,8 @@ pub async fn parse_columns(ddl: &str) -> Result<SchemaRef> {
         .sql(&format!("SELECT {select}"))
         .await
         .map_err(|e| NodraError::job(format!("invalid schema `{ddl}`: {e}")))?;
-    let fields: Vec<Field> = df
-        .schema()
-        .as_arrow()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone().with_nullable(true))
-        .collect();
+    let fields: Vec<Field> =
+        df.schema().as_arrow().fields().iter().map(|f| f.as_ref().clone().with_nullable(true)).collect();
     Ok(Arc::new(Schema::new(fields)))
 }
 
@@ -79,9 +74,9 @@ pub fn delta_type(dt: &DataType) -> Result<DataType> {
             DataType::List(Arc::new(delta_field(f)?))
         }
         DataType::FixedSizeList(f, _) => DataType::List(Arc::new(delta_field(f)?)),
-        DataType::Struct(fields) => DataType::Struct(
-            fields.iter().map(|f| delta_field(f)).collect::<Result<Fields>>()?,
-        ),
+        DataType::Struct(fields) => {
+            DataType::Struct(fields.iter().map(|f| delta_field(f)).collect::<Result<Fields>>()?)
+        }
         DataType::Map(f, sorted) => DataType::Map(Arc::new(delta_field(f)?), *sorted),
         DataType::Null => {
             return Err(NodraError::job(
@@ -152,8 +147,15 @@ pub fn cast_batch_by_name(batch: &RecordBatch, target: &SchemaRef) -> Result<Rec
                 .map_err(|_| NodraError::job(format!("the query result has no column `{}`", f.name())))
         })
         .collect::<Result<Vec<_>>>()?;
-    let fields: Vec<_> = target.fields().iter().map(|f| schema.field_with_name(f.name()).cloned()).collect::<std::result::Result<_, _>>()?;
-    let reordered = RecordBatch::try_new(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?;
+    let fields: Vec<_> = target
+        .fields()
+        .iter()
+        .map(|f| schema.field_with_name(f.name()).cloned())
+        .collect::<std::result::Result<_, _>>()?;
+    let reordered = RecordBatch::try_new(
+        std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
+        columns,
+    )?;
     cast_batch(&reordered, target)
 }
 
@@ -188,9 +190,10 @@ mod tests {
 
     #[tokio::test]
     async fn parses_columns() {
-        let s = parse_columns("ts TIMESTAMP, id BIGINT, name VARCHAR, ok BOOLEAN, d DATE, amount DECIMAL(10,2)")
-            .await
-            .unwrap();
+        let s =
+            parse_columns("ts TIMESTAMP, id BIGINT, name VARCHAR, ok BOOLEAN, d DATE, amount DECIMAL(10,2)")
+                .await
+                .unwrap();
         let names: Vec<_> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, ["ts", "id", "name", "ok", "d", "amount"]);
         assert_eq!(s.field(1).data_type(), &DataType::Int64);

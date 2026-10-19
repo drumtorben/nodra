@@ -60,7 +60,9 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     // Which partial files to read and which sink files to replace.
     let scoped: Option<HashSet<Vec<Option<String>>>> = match (&p.plan.merge_scope, merged) {
         (Some(MergeScope::Partitions(_)), Some(m)) if m < latest => {
-            match delta::changes(&partials, &delta::partition_columns(&partials)?, m as u64, latest as u64).await {
+            match delta::changes(&partials, &delta::partition_columns(&partials)?, m as u64, latest as u64)
+                .await
+            {
                 Ok(changes) => Some(
                     changes
                         .into_iter()
@@ -82,7 +84,8 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
         match &scoped {
             None => delta::removes_for(sink, |_| false),
             Some(affected) => delta::removes_for(sink, |pv| {
-                let values: Vec<Option<String>> = sink_parts.iter().map(|c| pv.get(c).cloned().flatten()).collect();
+                let values: Vec<Option<String>> =
+                    sink_parts.iter().map(|c| pv.get(c).cloned().flatten()).collect();
                 !affected.contains(&values)
             }),
         }
@@ -98,7 +101,8 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let states_plan = states.scan(&ctx.state(), None, &[], None).await?;
     let plan = partial::merge_plan(&physical, states_plan, &p.plan.split_group_names)?;
     let stream = execute_stream(plan, ctx.task_ctx())?;
-    let written = sink::write_stream(&sink, &delta::arrow_schema(&sink)?, sink::Columns::ByName, stream).await?;
+    let written =
+        sink::write_stream(&sink, &delta::arrow_schema(&sink)?, sink::Columns::ByName, stream).await?;
     let rows = written.rows;
     let adds: Vec<Action> = written.adds.into_iter().map(Action::Add).collect();
     let predicate = scoped.as_ref().map(|s| format!("nodra merge of {} partition(s)", s.len()));
@@ -118,7 +122,11 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
                     rows,
                     "merged"
                 );
-                return Ok(MergeOutcome::Merged { partials_version: latest, partitions: scoped.map(|s| s.len()), rows });
+                return Ok(MergeOutcome::Merged {
+                    partials_version: latest,
+                    partitions: scoped.map(|s| s.len()),
+                    rows,
+                });
             }
             CommitOutcome::Conflict => {
                 debug!("another merge committed first");

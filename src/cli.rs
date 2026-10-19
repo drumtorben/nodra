@@ -92,9 +92,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> Result<String> {
         *i += 1;
-        rest.get(*i)
-            .map(|s| s.to_string())
-            .ok_or_else(|| NodraError::config(format!("{flag} needs a value")))
+        rest.get(*i).map(|s| s.to_string()).ok_or_else(|| NodraError::config(format!("{flag} needs a value")))
     };
     while i < rest.len() {
         let a = rest[i].as_str();

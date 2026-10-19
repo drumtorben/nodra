@@ -22,13 +22,18 @@ pub async fn render(p: &Pipeline) -> Result<String> {
     let _ = writeln!(s, "target:  {target_loc} @ version {}", delta::version(&target)?);
     if let Some(si) = p.job.stream_source() {
         let src: Option<StreamRef> = match &p.job.sources[si] {
-            SourceSpec::JsonlStream { dir, .. } => JsonlStream::new(dir).ok().map(|j| std::sync::Arc::new(j) as StreamRef),
-            #[cfg(feature = "kafka")]
-            SourceSpec::Kafka { topic, brokers, properties, .. } => {
-                crate::source::kafka::KafkaSource::new(topic, brokers, &format!("nodra-{}", p.job.name), properties)
-                    .ok()
-                    .map(|k| std::sync::Arc::new(k) as StreamRef)
+            SourceSpec::JsonlStream { dir, .. } => {
+                JsonlStream::new(dir).ok().map(|j| std::sync::Arc::new(j) as StreamRef)
             }
+            #[cfg(feature = "kafka")]
+            SourceSpec::Kafka { topic, brokers, properties, .. } => crate::source::kafka::KafkaSource::new(
+                topic,
+                brokers,
+                &format!("nodra-{}", p.job.name),
+                properties,
+            )
+            .ok()
+            .map(|k| std::sync::Arc::new(k) as StreamRef),
             _ => None,
         };
         let _ = writeln!(s, "partitions:");
@@ -36,7 +41,8 @@ pub async fn render(p: &Pipeline) -> Result<String> {
             for part in src.partitions().await? {
                 let committed = delta::txn_version(&target, &p.stream_progress_key(si, part)).await?;
                 let (_, high) = src.watermarks(part).await?;
-                let lag = committed.map(|c| (high - c).max(0)).map(|l| l.to_string()).unwrap_or_else(|| "-".into());
+                let lag =
+                    committed.map(|c| (high - c).max(0)).map(|l| l.to_string()).unwrap_or_else(|| "-".into());
                 let _ = writeln!(
                     s,
                     "  p{part}: next offset {}, high watermark {high}, lag {lag}",

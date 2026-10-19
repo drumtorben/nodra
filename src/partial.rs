@@ -95,14 +95,23 @@ pub fn worker_plan(plan: &Arc<dyn ExecutionPlan>, group_names: &[String]) -> Res
     let schema = partial.schema();
     let exprs = order
         .iter()
-        .map(|&j| (Arc::new(Column::new(schema.field(j).name(), j)) as Arc<dyn PhysicalExpr>, schema.field(j).name().clone()))
+        .map(|&j| {
+            (
+                Arc::new(Column::new(schema.field(j).name(), j)) as Arc<dyn PhysicalExpr>,
+                schema.field(j).name().clone(),
+            )
+        })
         .collect::<Vec<_>>();
     Ok(Arc::new(ProjectionExec::try_new(exprs, partial)?))
 }
 
 /// Indices of `partial`'s fields in canonical order: the first `group_columns` fields reordered
 /// like `group_names`, then the remaining (state) fields unchanged.
-pub fn canonical_order(partial: &SchemaRef, group_columns: usize, group_names: &[String]) -> Result<Vec<usize>> {
+pub fn canonical_order(
+    partial: &SchemaRef,
+    group_columns: usize,
+    group_names: &[String],
+) -> Result<Vec<usize>> {
     let names: Vec<&String> = partial.fields().iter().take(group_columns).map(|f| f.name()).collect();
     if group_names.len() != group_columns {
         return Err(NodraError::job(format!(
@@ -116,9 +125,8 @@ pub fn canonical_order(partial: &SchemaRef, group_columns: usize, group_names: &
         match (hits.next(), hits.next()) {
             (Some((j, _)), None) => order.push(j),
             _ => {
-                return Err(NodraError::job(format!(
-                    "internal: group column `{wanted}` not found once among the physical group columns {names:?}"
-                )))
+                let msg = format!("internal: group column `{wanted}` is not unique among {names:?}");
+                return Err(NodraError::job(msg));
             }
         }
     }
@@ -246,7 +254,11 @@ fn rename_like(plan: Arc<dyn ExecutionPlan>, like: &SchemaRef) -> Result<Arc<dyn
 
 /// Project `states` (columns `s0..sN`, canonical layout) to the partial schema: order, types
 /// and names. `order[i]` is the partial-schema field stored as `s<i>`.
-fn restore_states(states: Arc<dyn ExecutionPlan>, partial: &SchemaRef, order: &[usize]) -> Result<Arc<dyn ExecutionPlan>> {
+fn restore_states(
+    states: Arc<dyn ExecutionPlan>,
+    partial: &SchemaRef,
+    order: &[usize],
+) -> Result<Arc<dyn ExecutionPlan>> {
     let input = states.schema();
     let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::with_capacity(partial.fields().len());
     for (j, f) in partial.fields().iter().enumerate() {

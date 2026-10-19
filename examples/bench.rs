@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use datafusion::arrow::array::{
+    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use deltalake_core::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake_core::kernel::StructType;
@@ -46,7 +48,9 @@ fn events(schema: &SchemaRef, from: i64, to: i64) -> nodra::Result<RecordBatch> 
             Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
             Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
             Arc::new(Int64Array::from(ids.iter().map(|i| (i * 7919) % 1000).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(ids.iter().map(|i| format!("user-{}", (i * 104_729) % 1_000_000)).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                ids.iter().map(|i| format!("user-{}", (i * 104_729) % 1_000_000)).collect::<Vec<_>>(),
+            )),
             Arc::new(Float64Array::from(ids.iter().map(|i| (i % 97) as f64 * 0.25).collect::<Vec<_>>())),
             Arc::new(StringArray::from(day)),
         ],
@@ -105,7 +109,9 @@ async fn main() -> nodra::Result<()> {
             c_schema,
             vec![
                 Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
-                Arc::new(StringArray::from(ids.iter().map(|i| format!("brand-{}", i % 40)).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    ids.iter().map(|i| format!("brand-{}", i % 40)).collect::<Vec<_>>(),
+                )),
             ],
         )?)
         .await?;

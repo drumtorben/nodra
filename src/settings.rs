@@ -14,10 +14,22 @@ pub const KNOWN_KEYS: &[(&str, &str, &str)] = &[
     ("nodra.max_records_per_partition", "100000", "Maximum stream records read per partition per batch."),
     ("nodra.ignore_changes", "false", "Skip deletes/updates in Delta sources instead of failing."),
     ("nodra.start", "earliest", "Where a source starts without progress: `earliest` or `latest`."),
-    ("nodra.merge_interval", "60s", "How often worker 0 runs the merge step of a class-3 job (0 = after every batch)."),
-    ("nodra.partials_location", "<sink>__nodra_partials", "Delta table that stores partial aggregate states."),
+    (
+        "nodra.merge_interval",
+        "60s",
+        "How often worker 0 runs the merge step of a class-3 job (0 = after every batch).",
+    ),
+    (
+        "nodra.partials_location",
+        "<sink>__nodra_partials",
+        "Delta table that stores partial aggregate states.",
+    ),
     ("nodra.commit_retries", "50", "How often a commit that lost a log-version race is retried."),
-    ("nodra.bad_messages", "fail", "Stream messages that do not match the schema: `fail` the job or `skip` (logged and counted)."),
+    (
+        "nodra.bad_messages",
+        "fail",
+        "Stream messages that do not match the schema: `fail` the job or `skip` (logged and counted).",
+    ),
 ];
 
 /// Parsed settings. Unknown `nodra.*` keys are rejected so typos surface early; other keys
@@ -45,18 +57,12 @@ impl Settings {
 
     /// All non-`nodra.*` settings, forwarded to DataFusion's `SessionConfig`.
     pub fn engine_options(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.values
-            .iter()
-            .filter(|(k, _)| !k.starts_with("nodra."))
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+        self.values.iter().filter(|(k, _)| !k.starts_with("nodra.")).map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
     /// All `nodra.*` settings that were set explicitly.
     pub fn nodra_options(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.values
-            .iter()
-            .filter(|(k, _)| k.starts_with("nodra."))
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+        self.values.iter().filter(|(k, _)| k.starts_with("nodra.")).map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
     /// `nodra.trigger`.
@@ -103,7 +109,9 @@ impl Settings {
             None => Ok(false),
             Some(s) if s == "fail" => Ok(false),
             Some(s) if s == "skip" => Ok(true),
-            Some(s) => Err(NodraError::config(format!("nodra.bad_messages must be `fail` or `skip`, got `{s}`"))),
+            Some(s) => {
+                Err(NodraError::config(format!("nodra.bad_messages must be `fail` or `skip`, got `{s}`")))
+            }
         }
     }
 
@@ -113,9 +121,9 @@ impl Settings {
             None => Ok(StartPosition::Earliest),
             Some(s) if s == "earliest" => Ok(StartPosition::Earliest),
             Some(s) if s == "latest" => Ok(StartPosition::Latest),
-            Some(s) => Err(NodraError::config(format!(
-                "nodra.start must be `earliest` or `latest`, got `{s}`"
-            ))),
+            Some(s) => {
+                Err(NodraError::config(format!("nodra.start must be `earliest` or `latest`, got `{s}`")))
+            }
         }
     }
 

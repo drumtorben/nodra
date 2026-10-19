@@ -28,7 +28,11 @@ fn job(name: &str, out: &std::path::Path, src: &std::path::Path, class3: bool, p
             loc(src)
         )
     } else {
-        format!("SET nodra.job_name = '{name}'; INSERT INTO delta('{}') SELECT id, cid FROM delta('{}'{pin})", loc(out), loc(src))
+        format!(
+            "SET nodra.job_name = '{name}'; INSERT INTO delta('{}') SELECT id, cid FROM delta('{}'{pin})",
+            loc(out),
+            loc(src)
+        )
     }
 }
 
@@ -49,7 +53,7 @@ async fn chain(class3: bool) {
         append(&src, events(100 + k * 10..110 + k * 10)).await; // versions 3..=6
     }
     run_some(&sql, &[0], 2).await.unwrap(); // generation 0: done = [6, 2]
-    // Generation 1 (3 workers) gets to version 3; every worker commits progress.
+                                            // Generation 1 (3 workers) gets to version 3; every worker commits progress.
     run_once(&job(&name, &out, &src, class3, Some(3)), 3).await.unwrap();
     // Back to 2 workers: generation 2.
     run_once(&sql, 2).await.unwrap();
@@ -165,7 +169,11 @@ async fn crash_before_the_first_commit_of_a_generation() {
     let dir = tempfile::tempdir().unwrap();
     let (src, out) = (dir.path().join("events"), dir.path().join("out"));
     events_table(&src, 2, 20).await;
-    let sql = format!("SET nodra.job_name = 'gencrash'; INSERT INTO delta('{}') SELECT id, cid FROM delta('{}')", loc(&out), loc(&src));
+    let sql = format!(
+        "SET nodra.job_name = 'gencrash'; INSERT INTO delta('{}') SELECT id, cid FROM delta('{}')",
+        loc(&out),
+        loc(&src)
+    );
     run_once(&sql, 2).await.unwrap();
     for k in 0..4 {
         append(&src, events(100 + k * 10..110 + k * 10)).await;

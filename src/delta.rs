@@ -127,6 +127,18 @@ mod azure {
         }
     }
 
+    pub(super) fn register() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let f = Arc::new(AzureFactory);
+            for scheme in ["az", "adl", "azure", "abfs", "abfss"] {
+                let u = Url::parse(&format!("{scheme}://")).expect("static url");
+                object_store_factories().insert(u.clone(), f.clone());
+                logstore_factories().insert(u, f.clone());
+            }
+        });
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -146,18 +158,6 @@ mod azure {
             assert!(store.to_string().contains("other"), "{store}");
             assert_eq!(path.as_ref(), "t");
         }
-    }
-
-    pub(super) fn register() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            let f = Arc::new(AzureFactory);
-            for scheme in ["az", "adl", "azure", "abfs", "abfss"] {
-                let u = Url::parse(&format!("{scheme}://")).expect("static url");
-                object_store_factories().insert(u.clone(), f.clone());
-                logstore_factories().insert(u, f.clone());
-            }
-        });
     }
 }
 
@@ -290,7 +290,9 @@ pub fn active_files(t: &DeltaTable) -> Result<Vec<DataFile>> {
     let mut out = Vec::with_capacity(snap.log_data().num_files());
     for f in snap.log_data().iter() {
         if f.deletion_vector_descriptor().is_some() {
-            return Err(NodraError::delta("table contains deletion vectors, which Nodra does not support yet"));
+            return Err(NodraError::delta(
+                "table contains deletion vectors, which Nodra does not support yet",
+            ));
         }
         let map = f.partition_values_map();
         out.push(DataFile {
@@ -421,7 +423,9 @@ fn txns_from_json(bytes: &[u8], map: &mut HashMap<String, i64>) -> Result<()> {
         }
         let val: Value = serde_json::from_slice(line)?;
         if let Some(txn) = val.get("txn") {
-            if let (Some(app), Some(ver)) = (txn.get("appId").and_then(Value::as_str), txn.get("version").and_then(Value::as_i64)) {
+            if let (Some(app), Some(ver)) =
+                (txn.get("appId").and_then(Value::as_str), txn.get("version").and_then(Value::as_i64))
+            {
                 map.insert(app.to_string(), ver);
             }
         }
@@ -434,16 +438,22 @@ pub async fn txns_in_commits(t: &DeltaTable, from: u64, to: u64) -> Result<HashM
     let log = t.log_store();
     let mut map = HashMap::new();
     for cv in from..=to {
-        let bytes = log.read_commit_entry(cv).await?.ok_or_else(|| {
-            NodraError::delta(format!("commit {cv} of {} is missing", t.table_url()))
-        })?;
+        let bytes = log
+            .read_commit_entry(cv)
+            .await?
+            .ok_or_else(|| NodraError::delta(format!("commit {cv} of {} is missing", t.table_url())))?;
         txns_from_json(&bytes, &mut map)?;
     }
     Ok(map)
 }
 
 /// Changes of commits `(from, to]`, read from the commit files. `t` may be an unloaded handle.
-pub async fn changes(t: &DeltaTable, partition_cols: &[String], from: u64, to: u64) -> Result<Vec<CommitChanges>> {
+pub async fn changes(
+    t: &DeltaTable,
+    partition_cols: &[String],
+    from: u64,
+    to: u64,
+) -> Result<Vec<CommitChanges>> {
     let parts = partition_cols.to_vec();
     let store = t.log_store();
     let mut out = Vec::new();
@@ -523,7 +533,11 @@ fn file_from_add(add: &Value, partition_cols: &[String]) -> Result<DataFile> {
 
 /// Open the table at `location`, creating it with `schema` and `partition_columns` if it does
 /// not exist. An existing table must have a compatible schema.
-pub async fn create_or_open(location: &str, schema: &Schema, partition_cols: &[String]) -> Result<DeltaTable> {
+pub async fn create_or_open(
+    location: &str,
+    schema: &Schema,
+    partition_cols: &[String],
+) -> Result<DeltaTable> {
     if let Some(t) = try_open(location).await? {
         check_compatible(&t, location, schema, partition_cols)?;
         return Ok(t);
@@ -579,7 +593,12 @@ pub fn roundtrip_schema(schema: &Schema) -> Result<Schema> {
     Ok((&kernel).try_into_arrow()?)
 }
 
-fn check_compatible(t: &DeltaTable, location: &str, schema: &Schema, partition_cols: &[String]) -> Result<()> {
+fn check_compatible(
+    t: &DeltaTable,
+    location: &str,
+    schema: &Schema,
+    partition_cols: &[String],
+) -> Result<()> {
     let existing_parts = partition_columns(t)?;
     if existing_parts != partition_cols {
         return Err(NodraError::delta(format!(
@@ -663,15 +682,17 @@ pub async fn commit(
             t.state = Some(done.snapshot);
             Ok(CommitOutcome::Committed(v))
         }
-        Err(DeltaTableError::Transaction { source: TransactionError::CommitConflict(C::ConcurrentTransaction) }) => {
-            Ok(CommitOutcome::Conflict)
-        }
+        Err(DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(C::ConcurrentTransaction),
+        }) => Ok(CommitOutcome::Conflict),
         Err(DeltaTableError::Transaction { source: TransactionError::CommitConflict(c) })
             if matches!(c, C::ConcurrentDeleteRead | C::ConcurrentDeleteDelete) =>
         {
             Ok(CommitOutcome::Retry(c.to_string()))
         }
-        Err(DeltaTableError::Transaction { source: TransactionError::MaxCommitAttempts(_) }) if max_retries == 0 => {
+        Err(DeltaTableError::Transaction { source: TransactionError::MaxCommitAttempts(_) })
+            if max_retries == 0 =>
+        {
             Ok(CommitOutcome::Stale)
         }
         Err(e) => Err(e.into()),
@@ -697,7 +718,10 @@ pub fn overwrite_op(partition_cols: &[String], predicate: Option<String>) -> Del
 }
 
 /// `remove` actions for the given files (data change).
-pub fn removes_for(t: &DeltaTable, keep: impl Fn(&HashMap<String, Option<String>>) -> bool) -> Result<Vec<Action>> {
+pub fn removes_for(
+    t: &DeltaTable,
+    keep: impl Fn(&HashMap<String, Option<String>>) -> bool,
+) -> Result<Vec<Action>> {
     let snap = t.snapshot()?;
     let mut out = Vec::new();
     for f in snap.log_data().iter() {

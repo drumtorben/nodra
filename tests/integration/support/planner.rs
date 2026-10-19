@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Date32Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::catalog::MemTable;
 use nodra::exec::{self, Pipeline};
@@ -29,13 +32,19 @@ pub async fn mem_reference(sql: &str, streams: &[RecordBatch]) -> (Vec<String>, 
                 let df = tmp.sql(&format!("SELECT * FROM {}", source_table(0))).await.unwrap();
                 let schema = Arc::new(df.schema().as_arrow().clone());
                 let batches = df.collect().await.unwrap();
-                ctx.register_table(source_table(i), Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()))
-                    .unwrap();
+                ctx.register_table(
+                    source_table(i),
+                    Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+                )
+                .unwrap();
             }
             _ => {
                 let b = streams[0].clone();
-                ctx.register_table(source_table(i), Arc::new(MemTable::try_new(b.schema(), vec![vec![b]]).unwrap()))
-                    .unwrap();
+                ctx.register_table(
+                    source_table(i),
+                    Arc::new(MemTable::try_new(b.schema(), vec![vec![b]]).unwrap()),
+                )
+                .unwrap();
             }
         }
     }
@@ -119,7 +128,11 @@ pub async fn cid_user_table(path: &Path, nusers: i64) {
     }
     let b = RecordBatch::try_new(
         schema,
-        vec![Arc::new(Int64Array::from(c)) as ArrayRef, Arc::new(StringArray::from(u)), Arc::new(StringArray::from(l))],
+        vec![
+            Arc::new(Int64Array::from(c)) as ArrayRef,
+            Arc::new(StringArray::from(u)),
+            Arc::new(StringArray::from(l)),
+        ],
     )
     .unwrap();
     append(path, b).await;
@@ -175,11 +188,15 @@ pub async fn typed_table_chunks(path: &Path, chunks: std::ops::Range<usize>) {
     }
     let strs = [Some("a/b c"), Some("100%=x"), Some("x=y"), None, Some("plain"), Some("%2F")];
     let ids: Vec<i64> = (0..48).collect();
-    let d: Vec<Option<i32>> = ids.iter().map(|i| if i % 5 == 4 { None } else { Some(20_370 + (i % 3) as i32) }).collect();
-    let n: Vec<Option<i32>> = ids.iter().map(|i| if i % 7 == 6 { None } else { Some((i % 4) as i32 - 1) }).collect();
+    let d: Vec<Option<i32>> =
+        ids.iter().map(|i| if i % 5 == 4 { None } else { Some(20_370 + (i % 3) as i32) }).collect();
+    let n: Vec<Option<i32>> =
+        ids.iter().map(|i| if i % 7 == 6 { None } else { Some((i % 4) as i32 - 1) }).collect();
     let b: Vec<Option<bool>> = ids.iter().map(|i| if i % 6 == 5 { None } else { Some(i % 2 == 0) }).collect();
-    let ts: Vec<Option<i64>> =
-        ids.iter().map(|i| if i % 8 == 7 { None } else { Some(1_760_000_000_000_000 + (i % 3) * 43_200_000_000) }).collect();
+    let ts: Vec<Option<i64>> = ids
+        .iter()
+        .map(|i| if i % 8 == 7 { None } else { Some(1_760_000_000_000_000 + (i % 3) * 43_200_000_000) })
+        .collect();
     let s: Vec<Option<&str>> = ids.iter().map(|i| strs[(*i as usize) % strs.len()]).collect();
     for chunk in chunks {
         let r = chunk * 12..(chunk + 1) * 12;

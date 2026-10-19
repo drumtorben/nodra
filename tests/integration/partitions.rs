@@ -81,7 +81,9 @@ async fn scoped_merge_with_null_and_date_partitions() {
         let p = run_once(sql, 2).await.unwrap();
         assert!(matches!(p.plan.merge_scope, Some(MergeScope::Partitions(_))), "{:?}", p.plan.merge_scope);
     }
-    for (batch, label) in [(with_day(events(300..310), None), "null"), (with_day(events(400..405), Some("2026-10-11")), "day")] {
+    for (batch, label) in
+        [(with_day(events(300..310), None), "null"), (with_day(events(400..405), Some("2026-10-11")), "day")]
+    {
         append(&src, batch).await;
         for sql in [&by_day, &by_date] {
             run_once(sql, 2).await.unwrap();

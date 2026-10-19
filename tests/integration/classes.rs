@@ -4,7 +4,10 @@ use crate::common;
 use std::sync::Arc;
 
 use common::*;
-use datafusion::arrow::array::{ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use datafusion::arrow::array::{
+    ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use nodra::planner::{JobClass, MergeScope};
 
@@ -25,7 +28,11 @@ fn spend(days: &[&str], per_day: i64) -> RecordBatch {
             Field::new("w", DataType::Float64, true),
             Field::new("day", DataType::Utf8, true),
         ])),
-        vec![Arc::new(Int64Array::from(cid)) as ArrayRef, Arc::new(Float64Array::from(w)), Arc::new(StringArray::from(day))],
+        vec![
+            Arc::new(Int64Array::from(cid)) as ArrayRef,
+            Arc::new(Float64Array::from(w)),
+            Arc::new(StringArray::from(day)),
+        ],
     )
     .unwrap()
 }
@@ -119,10 +126,21 @@ async fn odd_partition_values_and_types_roundtrip() {
         schema.clone(),
         vec![
             Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())) as ArrayRef,
-            Arc::new(TimestampMicrosecondArray::from((0..n).map(|i| 1_760_000_000_000_000 + i * 3_600_000_000).collect::<Vec<_>>()).with_timezone("UTC")),
+            Arc::new(
+                TimestampMicrosecondArray::from(
+                    (0..n).map(|i| 1_760_000_000_000_000 + i * 3_600_000_000).collect::<Vec<_>>(),
+                )
+                .with_timezone("UTC"),
+            ),
             Arc::new(Date32Array::from((0..n).map(|i| 20_000 + i as i32).collect::<Vec<_>>())),
-            Arc::new(Decimal128Array::from((0..n).map(|i| i as i128 * 125).collect::<Vec<_>>()).with_precision_and_scale(10, 2).unwrap()),
-            Arc::new(StringArray::from((0..n).map(|i| tags[(i % tags.len() as i64) as usize]).collect::<Vec<_>>())),
+            Arc::new(
+                Decimal128Array::from((0..n).map(|i| i as i128 * 125).collect::<Vec<_>>())
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(StringArray::from(
+                (0..n).map(|i| tags[(i % tags.len() as i64) as usize]).collect::<Vec<_>>(),
+            )),
         ],
     )
     .unwrap();

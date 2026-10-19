@@ -18,6 +18,7 @@ use nodra::NodraError;
 // ------------------------------------------------------------------------------------------ helpers
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields are read through `Debug` in assertion messages
 enum Outcome {
     Rejected(String),
     Failed(String),
@@ -54,7 +55,9 @@ impl Env {
     }
     /// `{E}` / `{D}` in `body` become the source calls; `sink_args` go into the sink call.
     fn sql(&self, name: &str, sink_args: &str, body: &str) -> String {
-        let q = body.replace("{E}", &format!("delta('{}')", self.e)).replace("{D}", &format!("delta('{}')", self.d));
+        let q = body
+            .replace("{E}", &format!("delta('{}')", self.e))
+            .replace("{D}", &format!("delta('{}')", self.d));
         format!("INSERT INTO delta('{}'{sink_args}) {q}", self.out(name))
     }
 }
@@ -145,7 +148,11 @@ fn spend(ndays: i64, per_day: i64) -> RecordBatch {
             Field::new("w", DataType::Float64, true),
             Field::new("day", DataType::Utf8, true),
         ])),
-        vec![Arc::new(Int64Array::from(cid)) as ArrayRef, Arc::new(Float64Array::from(w)), Arc::new(StringArray::from(day))],
+        vec![
+            Arc::new(Int64Array::from(cid)) as ArrayRef,
+            Arc::new(Float64Array::from(w)),
+            Arc::new(StringArray::from(day)),
+        ],
     )
     .unwrap()
 }
@@ -167,7 +174,11 @@ fn dim_rows(cids: std::ops::Range<i64>, pad: usize) -> RecordBatch {
             s
         })
         .collect();
-    RecordBatch::try_new(dim_schema(), vec![Arc::new(Int64Array::from(cid)), Arc::new(StringArray::from(brand))]).unwrap()
+    RecordBatch::try_new(
+        dim_schema(),
+        vec![Arc::new(Int64Array::from(cid)), Arc::new(StringArray::from(brand))],
+    )
+    .unwrap()
 }
 
 // ------------------------------------------------------------- A. CTE: driving source read twice
@@ -261,7 +272,11 @@ async fn b1_order_by_limit_class1() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn b2_order_by_limit_class2_join() {
     let env = env().await;
-    let sql = env.sql("b2", "", "SELECT e.id, d.brand FROM {E} e JOIN {D} d ON e.cid = d.cid ORDER BY e.id LIMIT 3");
+    let sql = env.sql(
+        "b2",
+        "",
+        "SELECT e.id, d.brand FROM {E} e JOIN {D} d ON e.cid = d.cid ORDER BY e.id LIMIT 3",
+    );
     let o = outcome(&sql, 3).await;
     report("b2_order_by_limit_class2_join", &o);
     assert!(o.correct(), "{o:?}");
@@ -453,7 +468,11 @@ async fn e_handled_correctly() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
     // DataFusion 55 cannot execute IN subqueries in projections: the job fails at plan time.
-    let sql = env.sql("in_projection", "", "SELECT id, cid IN (SELECT cid FROM {D} WHERE brand = 'brand-2') AS m FROM {E}");
+    let sql = env.sql(
+        "in_projection",
+        "",
+        "SELECT id, cid IN (SELECT cid FROM {D} WHERE brand = 'brand-2') AS m FROM {E}",
+    );
     let err = prepare(&sql).await.unwrap_err();
     assert!(err.to_string().contains("cannot plan query"), "{err}");
 }
@@ -496,7 +515,11 @@ async fn f_rejected_or_correct() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
     // A preserved broadcast side that is not driving would emit its unmatched rows on every worker.
-    let sql = env.sql("f_forced", "", "SELECT d.cid, e.id FROM delta('{DB}', broadcast => true) d LEFT JOIN {E} e ON e.cid = d.cid");
+    let sql = env.sql(
+        "f_forced",
+        "",
+        "SELECT d.cid, e.id FROM delta('{DB}', broadcast => true) d LEFT JOIN {E} e ON e.cid = d.cid",
+    );
     let sql = sql.replace("{DB}", &env.d);
     let o = outcome(&sql, 3).await;
     assert!(matches!(o, Outcome::Rejected(_)), "{o:?}");
@@ -521,7 +544,9 @@ async fn g_safe_but_rejected() {
     let o = outcome(&left, 3).await;
     report("g/left_join_dim_larger_than_fact", &o);
     assert!(matches!(o, Outcome::Matches { class: 2, .. }), "{o:?}");
-    let hinted = left.replace(&format!("delta('{}')", loc(&bigd)), &format!("delta('{}', broadcast => true)", loc(&bigd))).replace("g1", "g1h");
+    let hinted = left
+        .replace(&format!("delta('{}')", loc(&bigd)), &format!("delta('{}', broadcast => true)", loc(&bigd)))
+        .replace("g1", "g1h");
     let o = outcome(&hinted, 3).await;
     report("g/left_join_dim_larger_than_fact_with_hint", &o);
     assert!(matches!(o, Outcome::Matches { class: 2, .. }), "{o:?}");

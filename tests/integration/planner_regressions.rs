@@ -25,19 +25,24 @@ async fn scalar_subquery_below_class3_aggregate() {
     let mut bad = Vec::new();
     for (name, body) in [
         ("where", "SELECT cid, count(*) AS n FROM {E} WHERE cid > (SELECT avg(cid) FROM {D}) GROUP BY cid"),
-        ("agg_filter", "SELECT day, count(*) FILTER (WHERE cid > (SELECT min(cid) FROM {D})) AS n FROM {E} GROUP BY day"),
+        (
+            "agg_filter",
+            "SELECT day, count(*) FILTER (WHERE cid > (SELECT min(cid) FROM {D})) AS n FROM {E} GROUP BY day",
+        ),
         ("in_aggregate_arg", "SELECT day, sum(v * (SELECT count(*) FROM {D})) AS s FROM {E} GROUP BY day"),
     ] {
         let sql = format!(
             "INSERT INTO delta('{}') {}",
             loc(&dir.path().join(name)),
-            body.replace("{E}", &format!("delta('{}')", loc(&e))).replace("{D}", &format!("delta('{}')", loc(&d)))
+            body.replace("{E}", &format!("delta('{}')", loc(&e)))
+                .replace("{D}", &format!("delta('{}')", loc(&d)))
         );
         let o = outcome(&sql, 2, vec![]).await;
         println!("OUTCOME f1/{name}: {o:?}");
         // DataFusion 55 can only run scalar subqueries in a filter or projection as joins; inside
         // aggregates the job must fail at plan time, not on the workers.
-        let at_plan_time = matches!(&o, Outcome::Failed(e) if e.starts_with("prepare: job error: cannot plan query"));
+        let at_plan_time =
+            matches!(&o, Outcome::Failed(e) if e.starts_with("prepare: job error: cannot plan query"));
         if !(o.correct() || (name != "where" && at_plan_time)) {
             bad.push(format!("{name}: {o:?}"));
         }
@@ -177,7 +182,10 @@ async fn class4_pairs_partitions_by_typed_values() {
         let ts: Vec<i64> = ids.iter().map(|i| 1_760_000_000_000_000 + (i % 4) * 3_600_000_000).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC"))],
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
+            ],
         )
         .unwrap();
         append(t, batch).await;

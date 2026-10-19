@@ -147,7 +147,9 @@ fn workers(run: &RunArgs) -> Result<(Vec<u32>, u32)> {
         None => env_u32("NODRA_WORKER")?.unwrap_or(0),
     };
     if index >= count {
-        return Err(NodraError::config(format!("worker index {index} is not below the worker count {count}")));
+        return Err(NodraError::config(format!(
+            "worker index {index} is not below the worker count {count}"
+        )));
     }
     Ok((vec![index], count))
 }

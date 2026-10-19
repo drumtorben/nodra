@@ -153,16 +153,15 @@ pub fn place(gens: &BTreeMap<u32, Generation>, count: u32) -> Result<Placement> 
     let Some((&latest, last)) = gens.iter().next_back() else {
         return Ok(Placement { generation: 0, handover: None });
     };
-    let (generation, previous) = if last.count == count {
-        (latest, latest.checked_sub(1))
-    } else {
-        (latest + 1, Some(latest))
-    };
+    let (generation, previous) =
+        if last.count == count { (latest, latest.checked_sub(1)) } else { (latest + 1, Some(latest)) };
     let handover = match previous {
         None => None,
         Some(prev) => {
             let g = gens.get(&prev).ok_or_else(|| {
-                NodraError::delta(format!("progress of worker generation {prev} is missing from the target table"))
+                NodraError::delta(format!(
+                    "progress of worker generation {prev} is missing from the target table"
+                ))
             })?;
             let mut done = Vec::with_capacity(g.count as usize);
             for j in 0..g.count {
@@ -185,7 +184,9 @@ pub fn place(gens: &BTreeMap<u32, Generation>, count: u32) -> Result<Placement> 
             // Earlier generations were complete when their successors took over.
             let earlier = gens
                 .range(..prev)
-                .map(|(_, e)| (e.count, (0..e.count).map(|j| e.done.get(&j).copied().unwrap_or(-1)).collect()))
+                .map(|(_, e)| {
+                    (e.count, (0..e.count).map(|j| e.done.get(&j).copied().unwrap_or(-1)).collect())
+                })
                 .collect();
             Some(Handover { generation: prev, count: g.count, done, earlier })
         }
@@ -235,8 +236,11 @@ mod tests {
         let g01 = generations(&all(&[("w0of2", 10), ("w1of2", 12), ("g1/w2of3", 15)]), P).unwrap();
         assert_eq!(place(&g01, 3).unwrap().handover.unwrap().done, vec![10, 12]);
         // Back to 2 workers: generation 2, taking over from generation 1.
-        let g = generations(&all(&[("w0of2", 10), ("w1of2", 12), ("g1/w0of3", 20), ("g1/w1of3", 21), ("g1/w2of3", 22)]), P)
-            .unwrap();
+        let g = generations(
+            &all(&[("w0of2", 10), ("w1of2", 12), ("g1/w0of3", 20), ("g1/w1of3", 21), ("g1/w2of3", 22)]),
+            P,
+        )
+        .unwrap();
         let p = place(&g, 2).unwrap();
         assert_eq!(p.generation, 2);
         let h = p.handover.unwrap();

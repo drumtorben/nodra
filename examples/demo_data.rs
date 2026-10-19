@@ -12,7 +12,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use datafusion::arrow::array::{
+    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use deltalake_core::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake_core::kernel::StructType;
@@ -69,7 +71,9 @@ async fn main() -> nodra::Result<()> {
                 Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
                 Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
                 Arc::new(Int64Array::from(ids.iter().map(|i| (i * 7919) % 50).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(ids.iter().map(|i| format!("user-{}", (i * 104_729) % 3000)).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    ids.iter().map(|i| format!("user-{}", (i * 104_729) % 3000)).collect::<Vec<_>>(),
+                )),
                 Arc::new(StringArray::from(
                     ids.iter().map(|i| if i % 5 == 0 { "click" } else { "impression" }).collect::<Vec<_>>(),
                 )),
@@ -96,7 +100,9 @@ async fn main() -> nodra::Result<()> {
             vec![
                 Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
                 Arc::new(StringArray::from(ids.iter().map(|i| brands[*i as usize % 5]).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(ids.iter().map(|i| countries[*i as usize % 6]).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    ids.iter().map(|i| countries[*i as usize % 6]).collect::<Vec<_>>(),
+                )),
                 Arc::new(Float64Array::from(ids.iter().map(|i| 1.5 + (*i as f64) * 0.1).collect::<Vec<_>>())),
             ],
         )?,

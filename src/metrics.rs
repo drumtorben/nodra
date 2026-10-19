@@ -64,13 +64,30 @@ pub fn render() -> String {
         ("nodra_batches_total", "counter", "Batches committed.", |m| m.batches.load(Ordering::Relaxed)),
         ("nodra_rows_in_total", "counter", "Input rows read.", |m| m.rows_in.load(Ordering::Relaxed)),
         ("nodra_rows_out_total", "counter", "Rows written.", |m| m.rows_out.load(Ordering::Relaxed)),
-        ("nodra_files_written_total", "counter", "Data files written.", |m| m.files_written.load(Ordering::Relaxed)),
-        ("nodra_commit_retries_total", "counter", "Commit retries after log-version races.", |m| m.commit_retries.load(Ordering::Relaxed)),
-        ("nodra_progress_conflicts_total", "counter", "Batches abandoned due to concurrent progress.", |m| m.progress_conflicts.load(Ordering::Relaxed)),
-        ("nodra_last_batch_milliseconds", "gauge", "Duration of the last batch.", |m| m.last_batch_ms.load(Ordering::Relaxed)),
-        ("nodra_lag", "gauge", "Unprocessed input (records for streams, versions for Delta).", |m| m.lag.load(Ordering::Relaxed)),
-        ("nodra_last_commit_timestamp_seconds", "gauge", "Unix time of the last commit.", |m| m.last_commit_unix.load(Ordering::Relaxed)),
-        ("nodra_bad_messages_total", "counter", "Stream messages skipped (nodra.bad_messages = 'skip').", |m| m.bad_messages.load(Ordering::Relaxed)),
+        ("nodra_files_written_total", "counter", "Data files written.", |m| {
+            m.files_written.load(Ordering::Relaxed)
+        }),
+        ("nodra_commit_retries_total", "counter", "Commit retries after log-version races.", |m| {
+            m.commit_retries.load(Ordering::Relaxed)
+        }),
+        ("nodra_progress_conflicts_total", "counter", "Batches abandoned due to concurrent progress.", |m| {
+            m.progress_conflicts.load(Ordering::Relaxed)
+        }),
+        ("nodra_last_batch_milliseconds", "gauge", "Duration of the last batch.", |m| {
+            m.last_batch_ms.load(Ordering::Relaxed)
+        }),
+        ("nodra_lag", "gauge", "Unprocessed input (records for streams, versions for Delta).", |m| {
+            m.lag.load(Ordering::Relaxed)
+        }),
+        ("nodra_last_commit_timestamp_seconds", "gauge", "Unix time of the last commit.", |m| {
+            m.last_commit_unix.load(Ordering::Relaxed)
+        }),
+        (
+            "nodra_bad_messages_total",
+            "counter",
+            "Stream messages skipped (nodra.bad_messages = 'skip').",
+            |m| m.bad_messages.load(Ordering::Relaxed),
+        ),
     ];
     for (name, kind, help, get) in series {
         let _ = writeln!(out, "# HELP {name} {help}");

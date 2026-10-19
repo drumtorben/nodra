@@ -62,7 +62,11 @@ async fn rejected_job_and_usage_errors() {
     let src = dir.path().join("events");
     events_table(&src, 1, 5).await;
     let job = dir.path().join("bad.sql");
-    std::fs::write(&job, format!("INSERT INTO delta('/tmp/x') SELECT id FROM delta('{}') LIMIT 3", loc(&src))).unwrap();
+    std::fs::write(
+        &job,
+        format!("INSERT INTO delta('/tmp/x') SELECT id FROM delta('{}') LIMIT 3", loc(&src)),
+    )
+    .unwrap();
     let (code, _, stderr) = nodra(&["plan", &loc(&job)]);
     assert_eq!(code, 1);
     assert!(stderr.contains("plan rejected: LIMIT"), "{stderr}");

@@ -34,7 +34,12 @@ impl std::fmt::Debug for KafkaSource {
 
 impl KafkaSource {
     /// Connect to `brokers`; `properties` are passed to librdkafka unchanged.
-    pub fn new(topic: &str, brokers: &str, group: &str, properties: &BTreeMap<String, String>) -> Result<Self> {
+    pub fn new(
+        topic: &str,
+        brokers: &str,
+        group: &str,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<Self> {
         let mut cfg = ClientConfig::new();
         cfg.set("bootstrap.servers", brokers)
             .set("group.id", group)
@@ -90,8 +95,7 @@ impl StreamSource for KafkaSource {
     }
 
     async fn watermarks(&self, partition: i32) -> Result<(i64, i64)> {
-        self.blocking(move |c, topic| c.fetch_watermarks(topic, partition, TIMEOUT).map_err(kerr))
-            .await
+        self.blocking(move |c, topic| c.fetch_watermarks(topic, partition, TIMEOUT).map_err(kerr)).await
     }
 
     async fn fetch(&self, partition: i32, from: i64, until: i64, max: usize) -> Result<Fetched> {
@@ -153,7 +157,8 @@ mod tests {
     fn creates_consumer_without_broker_contact() {
         // librdkafka connects lazily, so construction validates the configuration only.
         KafkaSource::new("t", "127.0.0.1:1", "g", &BTreeMap::new()).unwrap();
-        let err = KafkaSource::new("t", "127.0.0.1:1", "g", &props(&[("no.such.property", "1")])).unwrap_err();
+        let err =
+            KafkaSource::new("t", "127.0.0.1:1", "g", &props(&[("no.such.property", "1")])).unwrap_err();
         assert!(err.to_string().contains("no.such.property"), "{err}");
     }
 

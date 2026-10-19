@@ -74,7 +74,13 @@ async fn kafka_start_latest_and_bad_messages() {
     dim_table(&dimp).await;
     // Existing messages are skipped with start = latest.
     produce(&bootstrap, "events", 0, &clicks(0..10).0);
-    let sql = job(&bootstrap, "events", &dimp, &out, "SET nodra.start = 'latest'; SET nodra.bad_messages = 'skip';");
+    let sql = job(
+        &bootstrap,
+        "events",
+        &dimp,
+        &out,
+        "SET nodra.start = 'latest'; SET nodra.bad_messages = 'skip';",
+    );
     run_once(&sql, 1).await.unwrap();
     let (mut lines, batch) = clicks(10..25);
     lines.insert(3, "not json".to_string());
