@@ -89,6 +89,7 @@ mod azure {
         ObjectStoreFactory, ObjectStoreRef, StorageConfig,
     };
     use deltalake_core::{DeltaResult, Path};
+    use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
     use url::Url;
 
     #[derive(Debug, Default)]
@@ -96,9 +97,22 @@ mod azure {
 
     impl ObjectStoreFactory for AzureFactory {
         fn parse_url_opts(&self, url: &Url, config: &StorageConfig) -> DeltaResult<(ObjectStoreRef, Path)> {
-            let (store, path) = object_store::parse_url_opts(url, config.raw.iter())?;
-            Ok((Arc::from(store), path))
+            // `object_store::parse_url_opts` would ignore the environment: start from it, so
+            // `AZURE_STORAGE_ACCOUNT_KEY`, service principals and workload identity work.
+            let mut builder = MicrosoftAzureBuilder::from_env().with_url(url.to_string());
+            for (key, value) in &config.raw {
+                if let Ok(k) = key.to_ascii_lowercase().parse::<AzureConfigKey>() {
+                    builder = builder.with_config(k, value);
+                }
+            }
+            let store = builder.build().map_err(object_store_error)?;
+            let path = Path::from_url_path(url.path()).map_err(|e| object_store_error(e.into()))?;
+            Ok((Arc::new(store), path))
         }
+    }
+
+    fn object_store_error(e: object_store::Error) -> deltalake_core::DeltaTableError {
+        deltalake_core::DeltaTableError::ObjectStore { source: e }
     }
 
     impl LogStoreFactory for AzureFactory {
@@ -110,6 +124,27 @@ mod azure {
             options: &StorageConfig,
         ) -> DeltaResult<Arc<dyn LogStore>> {
             Ok(default_logstore(prefixed, root, location, options))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn azure_store_reads_the_environment() {
+            // `abfss://container@account...` names the account itself; `az://container/...`
+            // relies on AZURE_STORAGE_ACCOUNT_NAME, which `object_store::parse_url_opts` ignores.
+            std::env::set_var("AZURE_STORAGE_ACCOUNT_NAME", "nodraenvaccount");
+            std::env::set_var("AZURE_STORAGE_ACCOUNT_KEY", "a2V5");
+            let url = Url::parse("az://container/lake/events").unwrap();
+            let (store, path) = AzureFactory.parse_url_opts(&url, &StorageConfig::default()).unwrap();
+            assert!(store.to_string().contains("nodraenvaccount"), "{store}");
+            assert_eq!(path.as_ref(), "lake/events");
+            let url = Url::parse("abfss://data@other.dfs.core.windows.net/t").unwrap();
+            let (store, path) = AzureFactory.parse_url_opts(&url, &StorageConfig::default()).unwrap();
+            assert!(store.to_string().contains("other"), "{store}");
+            assert_eq!(path.as_ref(), "t");
         }
     }
 
