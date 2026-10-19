@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 use crate::delta::{self, CommitOutcome, DataFile};
 use crate::error::{NodraError, Result};
 use crate::hash::{fnv1a64, worker_for};
+use crate::rescale;
 use crate::job::{source_table, Job, SinkMode, SourceSpec};
 use crate::metrics::{self, WorkerMetrics};
 use crate::partial;
@@ -62,6 +63,43 @@ pub struct Pipeline {
     pub sink_schema: SchemaRef,
     /// Physical layout of each Delta source (as planned).
     pub layouts: Vec<Option<delta::Layout>>,
+}
+
+/// Common prefix of the progress keys of Delta source `source` as the driving source.
+fn delta_source_prefix(job: &Job, source: usize) -> String {
+    format!("nodra/{}/{}/", job.name, job.sources[source].key())
+}
+
+/// The Delta source that earlier runs used as the driving source: the one with progress keys in
+/// the sink or the partials table. `None` for new jobs and stream jobs.
+async fn previous_driving(job: &Job) -> Result<Option<usize>> {
+    let candidates: Vec<usize> =
+        (0..job.sources.len()).filter(|i| matches!(job.sources[*i], SourceSpec::Delta { .. })).collect();
+    if job.stream_source().is_some() || candidates.len() < 2 {
+        return Ok(None);
+    }
+    let mut found = BTreeSet::new();
+    for location in [job.sink.uri().to_string(), partials_location(job)] {
+        let Some(t) = delta::try_open(&location).await? else { continue };
+        let Some(all) = delta::txn_map(&t).await? else {
+            warn!(table = %location, "cannot list progress keys (v2 checkpoint); the driving source is chosen by size");
+            continue;
+        };
+        for &i in &candidates {
+            if !crate::rescale::generations(&all, &delta_source_prefix(job, i))?.is_empty() {
+                found.insert(i);
+            }
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop_first()),
+        _ => Err(NodraError::job(format!(
+            "the target tables hold progress for several driving sources ({}); \
+             start the job under a new nodra.job_name",
+            found.iter().map(|i| job.sources[*i].describe()).collect::<Vec<_>>().join(", ")
+        ))),
+    }
 }
 
 /// Collect what the planner needs to know about each source, and the layouts of Delta sources.
@@ -104,7 +142,8 @@ impl Pipeline {
     /// Inspect the sources and plan the job.
     pub async fn prepare(job: Job) -> Result<Pipeline> {
         let (infos, layouts) = source_infos(&job).await?;
-        let plan = planner::plan_job(&job, &infos).await?;
+        let previous = previous_driving(&job).await?;
+        let plan = planner::plan_job_with(&job, &infos, previous).await?;
         let sink_schema = types::delta_schema(&plan.output_schema)?;
         if matches!(job.sink, crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. })
             && (job.stream_source().is_some() || plan.class != JobClass::PartitionParallel && plan.class != JobClass::BroadcastJoin)
@@ -137,9 +176,15 @@ impl Pipeline {
         format!("nodra/{}", self.job.name)
     }
 
-    /// Progress key of a Delta driving source for worker `i` of `n`.
+    /// Common prefix of the progress keys of Delta driving source `source`.
+    pub fn delta_source_prefix(&self, source: usize) -> String {
+        delta_source_prefix(&self.job, source)
+    }
+
+    /// Progress key of a Delta driving source for worker `i` of `n` (first worker generation;
+    /// see [`crate::rescale`]).
     pub fn delta_progress_key(&self, source: usize, i: u32, n: u32) -> String {
-        format!("{}/{}/w{i}of{n}", self.prefix(), self.job.sources[source].key())
+        crate::rescale::worker_key(&self.delta_source_prefix(source), 0, i, n)
     }
 
     /// Progress key of a stream partition.
@@ -341,6 +386,10 @@ struct Worker {
     /// All `txn` versions of `target` when it was loaded (None if not available).
     all_txns: Option<HashMap<String, i64>>,
     loaded_at: Option<Instant>,
+    /// Class 4: processed partitions seen with different files (warned about once).
+    changed_partitions: BTreeSet<String>,
+    /// Worker generation of a Delta driving source (decided on the first batch).
+    placement: Option<rescale::Placement>,
 }
 
 impl Worker {
@@ -376,6 +425,8 @@ impl Worker {
             known: HashMap::new(),
             all_txns: None,
             loaded_at: None,
+            changed_partitions: BTreeSet::new(),
+            placement: None,
         })
     }
 
@@ -433,6 +484,26 @@ impl Worker {
         Ok(v)
     }
 
+    /// Use `t` as the read snapshot from now on: forget progress read from older snapshots.
+    async fn adopt(&mut self, t: &DeltaTable) -> Result<()> {
+        self.known.clear();
+        self.all_txns = delta::txn_map(t).await?;
+        self.target = Some(t.clone());
+        self.loaded_at = Some(Instant::now());
+        Ok(())
+    }
+
+    /// True if every progress key still has the value the batch was computed from, as of `t`.
+    async fn verify(&mut self, t: &DeltaTable, progress: &[Progress]) -> Result<bool> {
+        let t = Some(t.clone());
+        for pr in progress {
+            if self.progress(&t, &pr.txn.app_id).await? != pr.expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Remember a successful commit: its snapshot becomes the next read snapshot.
     fn committed(&mut self, table: DeltaTable, progress: &[Progress]) {
         for pr in progress {
@@ -453,13 +524,44 @@ impl Worker {
         if p.overwrite() {
             return self.step_overwrite(target, di, uri, *pinned).await;
         }
-        let a_key = p.delta_progress_key(di, self.id.index, self.id.count);
-        let b_key = format!("{a_key}/snapshot");
+        let prefix = p.delta_source_prefix(di);
+        let placement = self.placement(&target, di, &prefix).await?;
+        let a_key = rescale::worker_key(&prefix, placement.generation, self.id.index, self.id.count);
+        let b_key = rescale::snapshot_key(&a_key);
         let committed = self.progress(&target, &a_key).await?;
-        if committed.is_none() {
-            self.check_rescale(&target, di).await?;
+        // A new generation starts where the previous one stopped. Until its first commit, the
+        // previous generation's progress must not move (its workers have to be stopped), and the
+        // first commit of the generation rewrites those keys: a still-running old worker's next
+        // commit then conflicts with it.
+        // Files the previous generation already processed are skipped for as long as the
+        // generation exists; the start and the fence only matter before its first commit.
+        let handover = placement.handover.clone();
+        let mut fence = Vec::new();
+        if let (None, Some(h)) = (committed, &handover) {
+            let started = self.all_txns.as_ref().is_some_and(|all| {
+                rescale::generations(all, &prefix).map(|g| g.contains_key(&placement.generation)).unwrap_or(false)
+            });
+            for j in 0..h.count {
+                let key = rescale::worker_key(&prefix, h.generation, j, h.count);
+                let now = self.progress(&target, &key).await?;
+                if now != Some(h.done[j as usize]) {
+                    self.placement = None;
+                    return Err(NodraError::config(format!(
+                        "worker {j} of the previous run with {} workers is still running (its progress moved from \
+                         version {} to {}); stop all of its workers before starting the job with {} workers",
+                        h.count,
+                        h.done[j as usize],
+                        now.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+                        self.id.count
+                    )));
+                }
+                if !started {
+                    fence.push(Progress::new(&key, h.done[j as usize], now));
+                }
+            }
         }
-        let progress = match (committed, self.cursor) {
+        let base = committed.or_else(|| handover.as_ref().map(rescale::Handover::start));
+        let progress = match (base, self.cursor) {
             (Some(c), Some(k)) if k > c => Some(k),
             (c, _) => c,
         };
@@ -476,12 +578,12 @@ impl Worker {
             None => {
                 if p.job.settings.start()? == StartPosition::Latest && pinned.is_none() {
                     info!(worker = self.id.index, version = latest, "starting at the latest source version");
-                    return self.commit_progress_only(target, vec![Progress::new(&a_key, latest, None)]).await;
+                    return self.commit_progress_only(target, vec![Progress::new(&a_key, latest, None)], false).await;
                 }
                 // Initial snapshot, processed in chunks of `max_files` files.
                 let b_committed = self.progress(&target, &b_key).await?;
                 let (snap_version, done) = match b_committed {
-                    Some(b) => (b >> 24, (b & 0xff_ffff) as usize),
+                    Some(b) => decode_snapshot(b),
                     None => (latest, 0),
                 };
                 let snap = delta::open_version(uri, snap_version).await?;
@@ -491,13 +593,16 @@ impl Worker {
                     .filter(|f| self.owns_file(f))
                     .collect();
                 files.sort_by(|a, b| a.path.as_ref().cmp(b.path.as_ref()));
-                let total_chunks = files.len().div_ceil(max_files).max(1);
-                let chunk: Vec<DataFile> = files.into_iter().skip(done * max_files).take(max_files).collect();
-                let last = done + 1 >= total_chunks;
+                // `done` counts files (not chunks), so changing max_files_per_batch between runs
+                // neither skips nor repeats files.
+                let total = files.len();
+                let chunk: Vec<DataFile> = files.into_iter().skip(done).take(max_files).collect();
+                let done_after = done + chunk.len();
+                let last = done_after >= total;
                 let txn = if last {
                     Progress::new(&a_key, snap_version, None)
                 } else {
-                    Progress::new(&b_key, (snap_version << 24) | (done as i64 + 1), b_committed)
+                    Progress::new(&b_key, encode_snapshot(snap_version, done_after)?, b_committed)
                 };
                 self.metrics.lag.store((latest - snap_version) as u64, Ordering::Relaxed);
                 let step = self.process(target, Input::Files(vec![(di, snap, chunk)]), vec![txn]).await?;
@@ -526,8 +631,11 @@ impl Worker {
                             c.version
                         )));
                     }
-                    files.extend(c.adds.into_iter().filter(|f| self.owns_file(f)));
-                    v_end = c.version as i64;
+                    let v = c.version as i64;
+                    files.extend(c.adds.into_iter().filter(|f| {
+                        self.owns_file(f) && !handover.as_ref().is_some_and(|h| h.processed(f.path.as_ref(), v))
+                    }));
+                    v_end = v;
                     if files.len() >= max_files {
                         break;
                     }
@@ -537,14 +645,18 @@ impl Worker {
                 if files.is_empty() {
                     // Nothing for this worker in these versions: remember, commit rarely.
                     self.cursor = Some(v_end);
-                    if v_end - committed.unwrap_or(-1) >= 100 {
-                        return self.commit_progress_only(target, vec![Progress::new(&a_key, v_end, committed)]).await;
+                    // A new generation records its progress right away: it completes the handover
+                    // (and fences the previous workers).
+                    if v_end - committed.unwrap_or(-1) >= 100 || committed.is_none() {
+                        let mut progress = vec![Progress::new(&a_key, v_end, committed)];
+                        progress.extend(fence);
+                        return self.commit_progress_only(target, progress, more).await;
                     }
                     return Ok(if more { Step::Processed { more } } else { Step::Idle });
                 }
-                let step = self
-                    .process(target, Input::Files(vec![(di, src, files)]), vec![Progress::new(&a_key, v_end, committed)])
-                    .await?;
+                let mut progress = vec![Progress::new(&a_key, v_end, committed)];
+                progress.extend(fence);
+                let step = self.process(target, Input::Files(vec![(di, src, files)]), progress).await?;
                 if step != Step::Conflict {
                     self.cursor = Some(v_end);
                 }
@@ -553,8 +665,14 @@ impl Worker {
                     other => other,
                 })
             }
-            Some(_) => {
+            Some(prog) => {
                 self.metrics.lag.store(0, Ordering::Relaxed);
+                if committed.is_none() {
+                    // Caught up right after a handover: record the progress (see above).
+                    let mut progress = vec![Progress::new(&a_key, prog, None)];
+                    progress.extend(fence);
+                    return self.commit_progress_only(target, progress, false).await;
+                }
                 Ok(Step::Idle)
             }
         }
@@ -586,41 +704,50 @@ impl Worker {
         worker_for(&key, self.id.count) == self.id.index
     }
 
-    /// Refuse to start a Delta-driven job with a new worker count while progress of another
-    /// worker count exists (files would be assigned differently).
-    async fn check_rescale(&self, target: &Option<DeltaTable>, di: usize) -> Result<()> {
-        let Some(t) = target else { return Ok(()) };
-        let other = |n: u32| {
-            NodraError::config(format!(
-                "the job was run with {n} workers before; changing the worker count of a \
-                 Delta-driven job is not supported yet (see docs/design.md, Rescaling)"
-            ))
-        };
-        match &self.all_txns {
-            Some(all) => {
-                // Keys look like `<prefix>/w<i>of<n>` (and `<prefix>/w<i>of<n>/snapshot`).
-                let prefix = self.p.delta_progress_key(di, 0, 1);
-                let prefix = prefix.trim_end_matches("w0of1");
-                for k in all.keys() {
-                    if let Some(rest) = k.strip_prefix(prefix) {
-                        let n = rest.split('/').next().and_then(|w| w.split_once("of")).and_then(|(_, n)| n.parse::<u32>().ok());
-                        if let Some(n) = n {
-                            if n != self.id.count {
-                                return Err(other(n));
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
+    /// This worker's generation (see [`crate::rescale`]), decided on its first batch. Fails if
+    /// a newer generation exists: the job was restarted with another worker count, and this
+    /// worker belongs to the old run.
+    async fn placement(&mut self, target: &Option<DeltaTable>, di: usize, prefix: &str) -> Result<rescale::Placement> {
+        let gens = match (target, &self.all_txns) {
+            (None, _) => BTreeMap::new(),
+            (Some(_), Some(all)) => rescale::generations(all, prefix)?,
+            (Some(t), None) => {
+                // The progress keys cannot be listed (v2 checkpoint): no rescaling.
                 for n in (1..=64u32).filter(|n| *n != self.id.count) {
                     if delta::txn_version(t, &self.p.delta_progress_key(di, 0, n)).await?.is_some() {
-                        return Err(other(n));
+                        return Err(NodraError::config(format!(
+                            "the job ran with {n} workers before; changing the worker count needs a target \
+                             table without v2 checkpoints"
+                        )));
                     }
                 }
+                return Ok(rescale::Placement { generation: 0, handover: None });
             }
+        };
+        if let Some(pl) = &self.placement {
+            if let Some((&newest, g)) = gens.iter().next_back() {
+                if newest > pl.generation {
+                    return Err(NodraError::config(format!(
+                        "the job was restarted with {} workers; this worker belongs to the previous run with {} workers \
+                         and stops",
+                        g.count, self.id.count
+                    )));
+                }
+            }
+            return Ok(pl.clone());
         }
-        Ok(())
+        let pl = rescale::place(&gens, self.id.count)?;
+        if let Some(h) = &pl.handover {
+            info!(
+                worker = self.id.index,
+                generation = pl.generation,
+                from_workers = h.count,
+                start_version = h.start(),
+                "taking over from the previous worker count"
+            );
+        }
+        self.placement = Some(pl.clone());
+        Ok(pl)
     }
 
     fn check_source_schema(&self, di: usize, t: &DeltaTable) -> Result<()> {
@@ -655,17 +782,23 @@ impl Worker {
         let mut txns = Vec::new();
         let mut more = false;
         let mut lag = 0i64;
-        for part in parts {
+        let mut committed_by_part = Vec::with_capacity(parts.len());
+        for &part in &parts {
             let key = self.p.stream_progress_key(si, part);
-            let committed = self.progress(&target, &key).await?;
+            committed_by_part.push((part, key.clone(), self.progress(&target, &key).await?));
+        }
+        // `start = latest` applies when none of this worker's partitions has progress (the job
+        // starts); partitions that appear later start at their earliest offset.
+        let first_start = committed_by_part.iter().all(|(_, _, c)| c.is_none());
+        for (part, key, committed) in committed_by_part {
             let (low, high) = src.watermarks(part).await?;
-            let from = match (committed, start) {
-                (Some(o), _) => o,
-                (None, StartPosition::Earliest) => low,
-                (None, StartPosition::Latest) => {
+            let from = match committed {
+                Some(o) => o,
+                None if start == StartPosition::Latest && first_start => {
                     txns.push(Progress::new(&key, high, None));
                     high
                 }
+                None => low,
             };
             if from < low {
                 return Err(NodraError::Source(format!(
@@ -730,20 +863,36 @@ impl Worker {
             }
             tables.push(t);
         }
-        let mut chosen: Vec<(String, Vec<Vec<DataFile>>)> = Vec::new();
+        let mut chosen: Vec<(String, Vec<Vec<DataFile>>, i64)> = Vec::new();
         let mut nfiles = 0;
         let mut pending = 0usize;
         for (key, files) in by_partition {
             if worker_for(&key, self.id.count) != self.id.index {
                 continue;
             }
-            if self.progress(&target, &p.partition_progress_key(&key)).await?.is_some() {
+            // The join is an inner join: a partition that has no files yet in one of the
+            // tables produces nothing now, and must not be marked as done.
+            if files.iter().any(Vec::is_empty) {
                 continue;
+            }
+            let fingerprint = partition_fingerprint(&files);
+            match self.progress(&target, &p.partition_progress_key(&key)).await? {
+                Some(done) => {
+                    if done != fingerprint && self.changed_partitions.insert(key.clone()) {
+                        warn!(
+                            worker = self.id.index,
+                            partition = %key,
+                            "partition changed after it was processed; class-4 jobs process every partition once, the change is ignored"
+                        );
+                    }
+                    continue;
+                }
+                None => {}
             }
             pending += 1;
             if nfiles < max_files {
                 nfiles += files.iter().map(Vec::len).sum::<usize>();
-                chosen.push((key, files));
+                chosen.push((key, files, fingerprint));
             }
         }
         self.metrics.lag.store(pending.saturating_sub(chosen.len()) as u64, Ordering::Relaxed);
@@ -751,10 +900,10 @@ impl Worker {
             return Ok(Step::Idle);
         }
         let more = pending > chosen.len();
-        let txns = chosen.iter().map(|(k, _)| Progress::new(p.partition_progress_key(k), 1, None)).collect();
+        let txns = chosen.iter().map(|(k, _, fp)| Progress::new(p.partition_progress_key(k), *fp, None)).collect();
         let mut inputs = Vec::new();
         for (slot, (&di, t)) in driving.iter().zip(tables).enumerate() {
-            let files = chosen.iter().flat_map(|(_, f)| f[slot].clone()).collect();
+            let files = chosen.iter().flat_map(|(_, f, _)| f[slot].clone()).collect();
             inputs.push((di, t, files));
         }
         let step = self.process(target, Input::Files(inputs), txns).await?;
@@ -766,16 +915,19 @@ impl Worker {
 
     // ---------------------------------------------------------------- shared ---------------
 
-    async fn commit_progress_only(&mut self, target: Option<DeltaTable>, progress: Vec<Progress>) -> Result<Step> {
+    async fn commit_progress_only(&mut self, target: Option<DeltaTable>, progress: Vec<Progress>, more: bool) -> Result<Step> {
         let target = match target {
             Some(t) => t,
-            None => self.create_target(None).await?,
+            None => match self.open_new_target(None, &progress).await? {
+                Some(t) => t,
+                None => return Ok(Step::Conflict),
+            },
         };
         let parts = delta::partition_columns(&target)?;
-        match self.commit_checked(target, Vec::new(), &progress, delta::append_op(&parts)).await? {
+        match self.commit_checked(target, Vec::new(), &progress, delta::append_op(&parts), false).await? {
             Some(v) => {
                 debug!(worker = self.id.index, version = v, "progress committed");
-                Ok(Step::Processed { more: false })
+                Ok(Step::Processed { more })
             }
             None => {
                 self.metrics.progress_conflicts.fetch_add(1, Ordering::Relaxed);
@@ -787,18 +939,38 @@ impl Worker {
     /// Commit with progress. Returns the new version, or `None` if another process committed
     /// progress for one of our keys. Conflicts caused by concurrent deletes on the target are
     /// retried on a fresh snapshot, after verifying that our progress keys are unchanged.
+    /// `replace_all` adds `remove` actions for every file of the read snapshot (overwrite); they
+    /// are recomputed whenever the commit has to move to a newer snapshot.
     async fn commit_checked(
         &mut self,
         mut target: DeltaTable,
         actions: Vec<Action>,
         progress: &[Progress],
         op: deltalake_core::protocol::DeltaOperation,
+        replace_all: bool,
     ) -> Result<Option<u64>> {
-        let retries = self.p.job.settings.commit_retries()?;
+        // Removes are only valid on the exact snapshot they were computed from.
+        let retries = if replace_all { 0 } else { self.p.job.settings.commit_retries()? };
         let txns: Vec<Transaction> = progress.iter().map(|p| p.txn.clone()).collect();
-        for attempt in 0..5 {
-            match delta::commit(&mut target, actions.clone(), txns.clone(), op.clone(), retries).await? {
+        for attempt in 0..20 {
+            let mut all = actions.clone();
+            if replace_all {
+                all.extend(delta::removes_for(&target, |_| false)?);
+            }
+            let read = delta::version(&target)?;
+            match delta::commit(&mut target, all, txns.clone(), op.clone(), retries).await? {
                 CommitOutcome::Committed(v) => {
+                    // Other processes committed in between: their progress updates are part of the
+                    // new snapshot, and of what the next batch must start from.
+                    if v > read + 1 {
+                        let between = delta::txns_in_commits(&target, read + 1, v - 1).await?;
+                        for (k, ver) in between {
+                            self.known.insert(k.clone(), Some(ver));
+                            if let Some(all) = &mut self.all_txns {
+                                all.insert(k, ver);
+                            }
+                        }
+                    }
                     self.committed(target, progress);
                     return Ok(Some(v));
                 }
@@ -809,16 +981,36 @@ impl Worker {
                 CommitOutcome::Retry(why) => {
                     warn!(worker = self.id.index, attempt, "commit conflicts with a concurrent change ({why}); retrying");
                     self.metrics.commit_retries.fetch_add(1, Ordering::Relaxed);
-                    target = delta::open(&self.p.target_location()).await?;
-                    for pr in progress {
-                        if delta::txn_version(&target, &pr.txn.app_id).await? != pr.expected {
-                            return Ok(None);
-                        }
-                    }
+                }
+                CommitOutcome::Stale => {
+                    debug!(worker = self.id.index, attempt, "target moved on; recomputing the commit");
+                    self.metrics.commit_retries.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            target = delta::open(&self.p.target_location()).await?;
+            self.adopt(&target).await?;
+            if !self.verify(&target, progress).await? {
+                self.invalidate();
+                return Ok(None);
+            }
         }
+        self.invalidate();
         Err(NodraError::delta("commit kept conflicting with concurrent changes to the target table"))
+    }
+
+    /// Create (or open) the target when the batch was planned without one. The table may have
+    /// been created concurrently, possibly with commits for our input, so it becomes the read
+    /// snapshot and the batch's progress is re-verified against it. `None`: another process
+    /// already committed progress for this input.
+    async fn open_new_target(&mut self, state_schema: Option<SchemaRef>, progress: &[Progress]) -> Result<Option<DeltaTable>> {
+        let t = self.create_target(state_schema).await?;
+        self.adopt(&t).await?;
+        if self.verify(&t, progress).await? {
+            Ok(Some(t))
+        } else {
+            self.invalidate();
+            Ok(None)
+        }
     }
 
     /// Create the target table. For class 3 the partial-state schema must be known.
@@ -880,26 +1072,32 @@ impl Worker {
         };
         let target = match target {
             Some(t) => t,
-            None => self.create_target(Some(target_schema.clone())).await?,
+            None => match self.open_new_target(Some(target_schema.clone()), &progress).await? {
+                Some(t) => t,
+                None => {
+                    self.metrics.progress_conflicts.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Step::Conflict);
+                }
+            },
         };
         let target_schema = delta::arrow_schema(&target)?;
         let stream = execute_stream(plan, ctx.task_ctx())?;
-        let written = sink::write_stream(&target, &target_schema, stream).await?;
+        let columns = if p.plan.class == JobClass::MergeableAggregation {
+            sink::Columns::ByPosition
+        } else {
+            sink::Columns::ByName
+        };
+        let written = sink::write_stream(&target, &target_schema, columns, stream).await?;
         let nfiles = written.adds.len();
         let rows_out = written.rows;
-        let mut actions: Vec<Action> = written.adds.into_iter().map(Action::Add).collect();
+        let actions: Vec<Action> = written.adds.into_iter().map(Action::Add).collect();
         let parts = delta::partition_columns(&target)?;
-        let op = match p.job.sink {
-            crate::job::SinkSpec::Delta { mode: SinkMode::Overwrite, .. } if p.plan.class != JobClass::MergeableAggregation => {
-                actions.extend(delta::removes_for(&target, |_| false)?);
-                delta::overwrite_op(&parts, None)
-            }
-            _ => delta::append_op(&parts),
-        };
+        let replace_all = p.overwrite() && p.plan.class != JobClass::MergeableAggregation;
+        let op = if replace_all { delta::overwrite_op(&parts, None) } else { delta::append_op(&parts) };
         if testing::should_fail(&p.job.name) {
             return Err(NodraError::job("injected failure before commit (test failpoint)"));
         }
-        match self.commit_checked(target, actions, &progress, op).await? {
+        match self.commit_checked(target, actions, &progress, op, replace_all).await? {
             Some(v) => {
                 self.metrics.batches.fetch_add(1, Ordering::Relaxed);
                 self.metrics.rows_in.fetch_add(rows_in, Ordering::Relaxed);
@@ -921,6 +1119,14 @@ impl Worker {
             }
         }
     }
+}
+
+/// A positive fingerprint of the files of one class-4 partition (stored as its progress value).
+fn partition_fingerprint(files: &[Vec<DataFile>]) -> i64 {
+    let mut paths: Vec<&str> = files.iter().flatten().map(|f| f.path.as_ref()).collect();
+    paths.sort_unstable();
+    let joined = paths.join("\n");
+    (fnv1a64(joined.as_bytes()) >> 1) as i64 | 1
 }
 
 /// Partition columns of the partial-state table: the group keys that sink partitions are derived
@@ -1025,15 +1231,34 @@ pub mod testing {
     }
 }
 
+/// Bits of the snapshot progress value that count processed files.
+const SNAPSHOT_FILE_BITS: u32 = 29;
+
+/// Progress through an initial snapshot: the snapshot's version in the high bits and the number
+/// of processed files (of this worker) in the low 29 bits; txn versions are a single `i64`.
+fn encode_snapshot(version: i64, files_done: usize) -> Result<i64> {
+    if files_done >= 1 << SNAPSHOT_FILE_BITS || !(0..1i64 << (63 - SNAPSHOT_FILE_BITS)).contains(&version) {
+        return Err(NodraError::job(format!(
+            "snapshot progress out of range (version {version}, {files_done} files)"
+        )));
+    }
+    Ok((version << SNAPSHOT_FILE_BITS) | files_done as i64)
+}
+
+fn decode_snapshot(v: i64) -> (i64, usize) {
+    (v >> SNAPSHOT_FILE_BITS, (v & ((1 << SNAPSHOT_FILE_BITS) - 1)) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn snapshot_progress_encoding_roundtrips() {
-        let v: i64 = 123_456;
-        let chunks: i64 = 77;
-        let enc = (v << 24) | chunks;
-        assert_eq!((enc >> 24, enc & 0xff_ffff), (v, chunks));
+        for (v, c) in [(0, 1), (123_456, 77), ((1 << 34) - 1, (1 << 29) - 1)] {
+            assert_eq!(decode_snapshot(encode_snapshot(v, c).unwrap()), (v, c));
+        }
+        assert!(encode_snapshot(1, 1 << 29).is_err());
+        assert!(encode_snapshot(1 << 34, 1).is_err());
     }
 }

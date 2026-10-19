@@ -2215,6 +2215,16 @@ name = "openssl-probe"
 version = "0.2.1"
 
 [[package]]
+name = "openssl-sys"
+version = "0.9.117"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 
@@ -2523,6 +2533,7 @@ dependencies = [
  "libc",
  "libz-sys",
  "num_enum",
+ "openssl-sys",
  "pkg-config",
 ]
 

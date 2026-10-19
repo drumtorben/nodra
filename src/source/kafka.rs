@@ -140,3 +140,32 @@ impl StreamSource for KafkaSource {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn creates_consumer_without_broker_contact() {
+        // librdkafka connects lazily, so construction validates the configuration only.
+        KafkaSource::new("t", "127.0.0.1:1", "g", &BTreeMap::new()).unwrap();
+        let err = KafkaSource::new("t", "127.0.0.1:1", "g", &props(&[("no.such.property", "1")])).unwrap_err();
+        assert!(err.to_string().contains("no.such.property"), "{err}");
+    }
+
+    #[cfg(feature = "kafka-ssl")]
+    #[test]
+    fn supports_sasl_ssl() {
+        let p = props(&[
+            ("security.protocol", "SASL_SSL"),
+            ("sasl.mechanism", "PLAIN"),
+            ("sasl.username", "$ConnectionString"),
+            ("sasl.password", "Endpoint=sb://example.servicebus.windows.net/"),
+        ]);
+        KafkaSource::new("t", "example.servicebus.windows.net:9093", "g", &p).unwrap();
+    }
+}

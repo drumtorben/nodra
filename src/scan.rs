@@ -7,10 +7,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::config::TableParquetOptions;
-use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::datasource::listing::helpers::expr_applicable_for_cols;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
@@ -18,7 +21,8 @@ use datafusion::datasource::table_schema::TableSchema;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DfResult;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use object_store::ObjectMeta;
@@ -85,12 +89,56 @@ impl FileListTable {
         self.files.len()
     }
 
+    /// The files whose partition values can satisfy `filters`. Only filters that reference
+    /// nothing but partition columns are used; DataFusion still applies all filters to the rows
+    /// (and uses the others for Parquet statistics pruning).
+    fn prune(&self, state: &dyn Session, filters: &[Expr]) -> DfResult<Vec<PartitionedFile>> {
+        let names: Vec<&str> = self.partition_fields.iter().map(|f| f.name().as_str()).collect();
+        let applicable: Vec<Expr> = filters
+            .iter()
+            .filter(|e| !names.is_empty() && expr_applicable_for_cols(&names, e))
+            .map(|e| unqualify(e.clone()))
+            .collect::<DfResult<_>>()?;
+        let Some(predicate) = conjunction(applicable) else { return Ok(self.files.clone()) };
+        let schema = Arc::new(Schema::new(self.partition_fields.clone()));
+        let predicate = state.create_physical_expr(predicate, &DFSchema::try_from(schema.as_ref().clone())?)?;
+        // One row per file, one column per partition column.
+        let columns = (0..self.partition_fields.len())
+            .map(|i| ScalarValue::iter_to_array(self.files.iter().map(|f| f.partition_values[i].clone())))
+            .collect::<DfResult<Vec<ArrayRef>>>()?;
+        let batch = RecordBatch::try_new(schema, columns)?;
+        let mask = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let Some(mask) = mask.as_any().downcast_ref::<BooleanArray>() else {
+            return Ok(self.files.clone());
+        };
+        Ok(self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask.is_valid(*i) && mask.value(*i))
+            .map(|(_, f)| f.clone())
+            .collect())
+    }
+
     /// Mark this table as the driving source (see [`crate::partial`]).
     pub fn mark_driving(mut self) -> Self {
         self.file_schema = crate::partial::mark_driving(&self.file_schema);
         self.schema = crate::partial::mark_driving(&self.schema);
         self
     }
+}
+
+/// Drop table qualifiers (`e.day` → `day`) so the expression resolves against the partition schema.
+fn unqualify(e: Expr) -> DfResult<Expr> {
+    e.transform(|e| {
+        Ok(match e {
+            Expr::Column(c) if c.relation.is_some() => {
+                Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
+            }
+            e => Transformed::no(e),
+        })
+    })
+    .map(|t| t.data)
 }
 
 /// Convert a Delta partition value string to a typed scalar.
@@ -117,24 +165,30 @@ impl TableProvider for FileListTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        // Filters reach `scan` for partition pruning; DataFusion keeps applying them as well.
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if self.files.is_empty() {
+        let files = if self.files.is_empty() { Vec::new() } else { self.prune(state, filters)? };
+        if files.is_empty() {
             let schema = match projection {
                 Some(p) => Arc::new(self.schema.project(p)?),
                 None => self.schema.clone(),
             };
             return Ok(Arc::new(EmptyExec::new(schema)));
         }
-        let groups_n = state.config().target_partitions().max(1).min(self.files.len());
+        let groups_n = state.config().target_partitions().max(1).min(files.len());
         let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); groups_n];
-        for (i, f) in self.files.iter().enumerate() {
-            groups[i % groups_n].push(f.clone());
+        for (i, f) in files.into_iter().enumerate() {
+            groups[i % groups_n].push(f);
         }
         let table_schema = TableSchema::builder(self.file_schema.clone())
             .with_table_partition_cols(self.partition_fields.clone())
@@ -150,5 +204,64 @@ impl TableProvider for FileListTable {
             .with_limit(limit)
             .build();
         Ok(DataSourceExec::from_data_source(config))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::parquet::file::properties::WriterProperties;
+    use datafusion::prelude::SessionContext;
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
+
+    #[tokio::test]
+    async fn filters_prune_row_groups_and_partitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let mut files = Vec::new();
+        for day in ["2026-01-01", "2026-01-02"] {
+            std::fs::create_dir_all(dir.path().join(format!("day={day}"))).unwrap();
+            let rel = format!("day={day}/part.parquet");
+            let file = std::fs::File::create(dir.path().join(&rel)).unwrap();
+            let props = WriterProperties::builder().set_max_row_group_row_count(Some(10)).build();
+            let mut w = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(0..100))]).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            let size = std::fs::metadata(dir.path().join(&rel)).unwrap().len();
+            files.push(DataFile {
+                path: Path::from(rel),
+                size,
+                partition_values: vec![Some(day.to_string())],
+                num_records: Some(100),
+            });
+        }
+        let ctx = SessionContext::new();
+        let url = ObjectStoreUrl::parse("nodra://t").unwrap();
+        ctx.register_object_store(url.as_ref(), Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()));
+        let day = Arc::new(Field::new("day", DataType::Utf8, true));
+        let table = FileListTable::try_new(schema, vec![day], url, &files).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+
+        let sql = "SELECT count(*) AS n FROM t WHERE x >= 95 AND day = '2026-01-02'";
+        let df = ctx.sql(sql).await.unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let rows = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+        let n = rows[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(n, 5);
+
+        // The other partition's file is not scanned at all; the predicate reached the Parquet
+        // scan, which skipped 9 of the 10 row groups of the remaining file.
+        let metrics = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(!metrics.contains("day=2026-01-01/part.parquet"), "{metrics}");
+        assert!(metrics.contains("predicate="), "{metrics}");
+        assert!(metrics.contains("row_groups_pruned_statistics=10 total → 1 matched"), "{metrics}");
     }
 }

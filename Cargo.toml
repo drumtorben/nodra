@@ -10,6 +10,8 @@ license = "Apache-2.0"
 default = []
 azure = ["object_store/azure"]
 kafka = ["dep:rdkafka"]
+# Kafka with TLS and SASL/PLAIN/SCRAM (links the system OpenSSL).
+kafka-ssl = ["kafka", "rdkafka/ssl"]
 
 [dependencies]
 datafusion = { version = "55.2", default-features = false, features = ["parquet", "sql", "datetime_expressions", "string_expressions", "regex_expressions", "unicode_expressions"] }

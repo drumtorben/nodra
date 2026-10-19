@@ -47,23 +47,52 @@ pub async fn render(p: &Pipeline, workers: Option<u32>) -> Result<String> {
         }
     } else if p.plan.class != JobClass::CoPartitionedJoin {
         let di = p.plan.driving()[0];
-        let range: Vec<u32> = match workers {
-            Some(n) => vec![n],
-            None => (1..=64).collect(),
-        };
-        for n in range {
-            let mut found = Vec::new();
-            for i in 0..n {
-                if let Some(v) = delta::txn_version(&target, &p.delta_progress_key(di, i, n)).await? {
-                    found.push((i, v));
+        match delta::txn_map(&target).await? {
+            Some(all) => {
+                let gens = crate::rescale::generations(&all, &p.delta_source_prefix(di))?;
+                let latest = gens.keys().next_back().copied();
+                for (g, gen) in &gens {
+                    let state = if Some(*g) == latest { "current" } else { "previous run" };
+                    let _ = writeln!(s, "workers: {} (generation {g}, {state})", gen.count);
+                    for i in 0..gen.count {
+                        let v = match (gen.done.get(&i), gen.snapshot.contains(&i)) {
+                            (Some(v), _) => format!("source version {v}"),
+                            (None, true) => "processing the initial snapshot".to_string(),
+                            (None, false) => "no progress yet".to_string(),
+                        };
+                        let _ = writeln!(s, "  worker {i}: {v}");
+                    }
                 }
             }
-            if !found.is_empty() {
-                let _ = writeln!(s, "workers: {n}");
-                for (i, v) in found {
-                    let _ = writeln!(s, "  worker {i}: source version {v}");
+            None => {
+                // The keys cannot be listed (v2 checkpoint): probe worker counts.
+                let range: Vec<u32> = match workers {
+                    Some(n) => vec![n],
+                    None => (1..=64).collect(),
+                };
+                for n in range {
+                    let mut found = Vec::new();
+                    for i in 0..n {
+                        if let Some(v) = delta::txn_version(&target, &p.delta_progress_key(di, i, n)).await? {
+                            found.push((i, v));
+                        }
+                    }
+                    if !found.is_empty() {
+                        let _ = writeln!(s, "workers: {n}");
+                        for (i, v) in found {
+                            let _ = writeln!(s, "  worker {i}: source version {v}");
+                        }
+                    }
                 }
             }
+        }
+    } else {
+        let parts = delta::txn_map(&target).await?.map(|all| {
+            let prefix = format!("nodra/{}/part/", p.job.name);
+            all.keys().filter(|k| k.starts_with(&prefix)).count()
+        });
+        if let Some(n) = parts {
+            let _ = writeln!(s, "partitions: {n} processed");
         }
     }
     if p.plan.class == JobClass::MergeableAggregation {

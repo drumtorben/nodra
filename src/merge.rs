@@ -71,15 +71,18 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
         }
         _ => None,
     };
-    let (files, removes): (Vec<DataFile>, Vec<Action>) = match &scoped {
-        None => (all_files, delta::removes_for(&sink, |_| false)?),
-        Some(affected) => {
-            let files = all_files.into_iter().filter(|f| affected.contains(&f.partition_values)).collect();
-            let removes = delta::removes_for(&sink, |pv| {
+    let files: Vec<DataFile> = match &scoped {
+        None => all_files,
+        Some(affected) => all_files.into_iter().filter(|f| affected.contains(&f.partition_values)).collect(),
+    };
+    // The sink files the merge replaces, as of `sink` (recomputed if the sink moves on).
+    let removes = |sink: &deltalake_core::DeltaTable| -> Result<Vec<Action>> {
+        match &scoped {
+            None => delta::removes_for(sink, |_| false),
+            Some(affected) => delta::removes_for(sink, |pv| {
                 let values: Vec<Option<String>> = sink_parts.iter().map(|c| pv.get(c).cloned().flatten()).collect();
                 !affected.contains(&values)
-            })?;
-            (files, removes)
+            }),
         }
     };
 
@@ -93,42 +96,51 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let states_plan = states.scan(&ctx.state(), None, &[], None).await?;
     let plan = partial::merge_plan(&physical, states_plan)?;
     let stream = execute_stream(plan, ctx.task_ctx())?;
-    let written = sink::write_stream(&sink, &delta::arrow_schema(&sink)?, stream).await?;
+    let written = sink::write_stream(&sink, &delta::arrow_schema(&sink)?, sink::Columns::ByName, stream).await?;
     let rows = written.rows;
-    let mut actions = removes;
-    actions.extend(written.adds.into_iter().map(Action::Add));
+    let adds: Vec<Action> = written.adds.into_iter().map(Action::Add).collect();
     let predicate = scoped.as_ref().map(|s| format!("nodra merge of {} partition(s)", s.len()));
     let op = delta::overwrite_op(&sink_parts, predicate);
-    let retries = p.job.settings.commit_retries()?;
-    match delta::commit(&mut sink, actions, vec![Transaction::new(&key, latest)], op, retries).await? {
-        CommitOutcome::Committed(v) => {
-            info!(
-                sink_version = v,
-                partials_version = latest,
-                partitions = ?scoped.as_ref().map(HashSet::len),
-                rows,
-                "merged"
-            );
-            Ok(MergeOutcome::Merged { partials_version: latest, partitions: scoped.map(|s| s.len()), rows })
+    // The removes are only valid on the snapshot they were computed from: commit without
+    // delta-rs retries (which would accept e.g. a concurrent OPTIMIZE that rewrote the files we
+    // remove, and keep the old rows), and recompute them on a newer snapshot instead.
+    for attempt in 0..20 {
+        let mut actions = removes(&sink)?;
+        actions.extend(adds.iter().cloned());
+        match delta::commit(&mut sink, actions, vec![Transaction::new(&key, latest)], op.clone(), 0).await? {
+            CommitOutcome::Committed(v) => {
+                info!(
+                    sink_version = v,
+                    partials_version = latest,
+                    partitions = ?scoped.as_ref().map(HashSet::len),
+                    rows,
+                    "merged"
+                );
+                return Ok(MergeOutcome::Merged { partials_version: latest, partitions: scoped.map(|s| s.len()), rows });
+            }
+            CommitOutcome::Conflict => {
+                debug!("another merge committed first");
+                return Ok(MergeOutcome::Conflict);
+            }
+            CommitOutcome::Retry(why) => debug!(attempt, "merge conflicts with a concurrent change: {why}"),
+            CommitOutcome::Stale => debug!(attempt, "the sink moved on; recomputing the merge commit"),
         }
-        CommitOutcome::Conflict => {
+        sink = delta::open(p.job.sink.uri()).await?;
+        if delta::txn_version(&sink, &key).await? != merged {
             debug!("another merge committed first");
-            Ok(MergeOutcome::Conflict)
-        }
-        // The sink changed concurrently (e.g. a DELETE); the next merge recomputes from scratch.
-        CommitOutcome::Retry(why) => {
-            debug!("merge conflicts with a concurrent change: {why}");
-            Ok(MergeOutcome::Conflict)
+            return Ok(MergeOutcome::Conflict);
         }
     }
+    Err(crate::NodraError::delta("the merge commit kept conflicting with concurrent changes to the sink"))
 }
 
-/// Partition columns of the partials table (for tests and status output).
+/// Partition values of the partials files added by `changes` (for tests and status output).
 pub fn affected_partitions(changes: &[delta::CommitChanges]) -> BTreeSet<Vec<Option<String>>> {
     changes.iter().flat_map(|c| c.adds.iter().map(|f| f.partition_values.clone())).collect()
 }
 
-#[allow(unused)]
+// Compile-time check that the merge future can run on a multi-threaded runtime.
+#[allow(unused, clippy::manual_async_fn)]
 fn _assert_send(p: Arc<Pipeline>) -> impl std::future::Future<Output = Result<MergeOutcome>> + Send {
     async move { merge(&p).await }
 }

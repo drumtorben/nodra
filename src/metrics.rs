@@ -53,11 +53,14 @@ pub fn worker(job: &str, worker: u32) -> Arc<WorkerMetrics> {
         .clone()
 }
 
+/// Name, type, help text and accessor of one metric.
+type Series = (&'static str, &'static str, &'static str, fn(&WorkerMetrics) -> u64);
+
 /// Render all metrics in Prometheus text format.
 pub fn render() -> String {
     let reg = registry().lock().expect("metrics registry poisoned");
     let mut out = String::new();
-    let series: [(&str, &str, &str, fn(&WorkerMetrics) -> u64); 10] = [
+    let series: [Series; 10] = [
         ("nodra_batches_total", "counter", "Batches committed.", |m| m.batches.load(Ordering::Relaxed)),
         ("nodra_rows_in_total", "counter", "Input rows read.", |m| m.rows_in.load(Ordering::Relaxed)),
         ("nodra_rows_out_total", "counter", "Rows written.", |m| m.rows_out.load(Ordering::Relaxed)),

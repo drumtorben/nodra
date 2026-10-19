@@ -1,0 +1,66 @@
+# One Nodra job, 8 workers. The pod ordinal (nodra-hourly-clicks-<n>) is the worker index.
+# Workers share nothing but the Delta tables, so pods can be rescheduled freely; a restarted
+# pod resumes from the progress stored in the sink.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nodra-hourly-clicks
+data:
+  job.sql: |
+    SET nodra.job_name = 'silver_clicks';   -- part of every progress key: never change it
+    SET nodra.trigger = '30s';
+    INSERT INTO delta('abfss://lake@myaccount.dfs.core.windows.net/silver/clicks', partition_by => 'day')
+    SELECT c.*, to_char(c.ts, '%Y-%m-%d') AS day
+    FROM kafka('clicks', brokers => 'kafka:9092',
+               schema => 'ts TIMESTAMP, campaign_id BIGINT, user_id VARCHAR') c;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodra-hourly-clicks
+  labels: { app: nodra-hourly-clicks }
+spec:
+  clusterIP: None            # headless: required by the StatefulSet, also used for scraping
+  selector: { app: nodra-hourly-clicks }
+  ports:
+    - { name: metrics, port: 9464 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nodra-hourly-clicks
+spec:
+  serviceName: nodra-hourly-clicks
+  replicas: 8                 # keep equal to --workers
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: nodra-hourly-clicks }
+  template:
+    metadata:
+      labels:
+        app: nodra-hourly-clicks
+        azure.workload.identity/use: "true"   # Azure workload identity for the storage account
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+    spec:
+      serviceAccountName: nodra   # federated with a managed identity (Storage Blob Data Contributor)
+      terminationGracePeriodSeconds: 300   # SIGTERM finishes the running batch
+      containers:
+        - name: nodra
+          image: ghcr.io/your-org/nodra:0.1.0
+          args: ["run", "/jobs/job.sql", "--worker", "auto", "--workers", "8",
+                 "--metrics-addr", "0.0.0.0:9464"]
+          env:
+            - { name: AZURE_STORAGE_ACCOUNT_NAME, value: myaccount }
+            - { name: RUST_LOG, value: info }
+          ports:
+            - { name: metrics, containerPort: 9464 }
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits: { memory: 8Gi }
+          volumeMounts:
+            - { name: job, mountPath: /jobs }
+      volumes:
+        - name: job
+          configMap: { name: nodra-hourly-clicks }
