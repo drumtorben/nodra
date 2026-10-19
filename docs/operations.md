@@ -91,7 +91,11 @@ can simply be repeated.
   * Do not overlap old and new workers. If an old worker keeps running anyway, new workers
     refuse to start while its progress moves, and the old worker stops (with an error) at its
     next commit or within five minutes.
-  * Rescaling back to an earlier worker count works the same way.
+  * Rescaling back to an earlier worker count works the same way, also several times in a row.
+  * Two different new worker counts at the same time (e.g. a leftover `--once` cron job with an
+    old `--workers` value) are refused. Note that a single stray process with another worker
+    count *does* start a new generation and stops the regular workers — keep `--workers` in
+    one place.
 
 ## Changing a job
 
@@ -99,5 +103,7 @@ Progress keys contain the job name and source locations. Changing the query keep
 (new logic applies to new data only); renaming the job or a source location starts from scratch.
 The sink's columns are matched by name, so reordering output columns is fine; adding, removing
 or retyping columns is not (no schema evolution yet). If a source schema changes, workers stop
-and must be restarted, which re-plans the job. The driving source of a job never changes once
-it has run; `nodra plan` notes it.
+and must be restarted, which re-plans the job. The driving source and the class of a job never
+change once it has run; `nodra plan` notes it. If a broadcast table grows beyond
+`nodra.broadcast_threshold`, the job stops with a hint: raise the threshold (or set
+`broadcast => true`) to keep the job as it is, or start it under a new `nodra.job_name`.

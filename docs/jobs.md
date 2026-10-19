@@ -88,13 +88,17 @@ with `--set key=value`.
 ## Progress keys
 
 Progress is stored as Delta `txn` actions (`appId` → version) in the table the worker commits
-to (the sink, or the partials table for class 3). `nodra status` prints them.
+to (the sink, or the partials table for class 3). `nodra status` prints them. `<source>` is the
+source's canonical location (`delta:/lake/events`, `kafka:clicks`): `/lake/events`,
+`/lake/./events/` and `file:///lake/events` are the same source.
 
 | Key | Version |
 | --- | --- |
 | `nodra/<job>/<source>/w<i>of<n>` | last processed source version (Delta driving source) |
 | `nodra/<job>/<source>/g<g>/w<i>of<n>` | the same, after the worker count changed (generation `g`) |
 | `<worker key>/snapshot` | snapshot version and files done during the first run |
+| `nodra/<job>/<source>/start` | source version all first workers start from (Delta driving source) |
 | `nodra/<job>/<source>/p<partition>` | next offset to read (stream) |
+| `nodra/<job>/<source>/start/p<partition>` | high watermark at the job start (stream, `start = latest`) |
 | `nodra/<job>/part/<hash>` | fingerprint of a processed partition's files (class 4) |
 | `nodra/<job>/merge` | partials-table version merged (class 3, in the sink) |
