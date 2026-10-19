@@ -87,6 +87,9 @@ pub fn generations(all: &HashMap<String, i64>, prefix: &str) -> Result<BTreeMap<
         };
         let Some((i, n)) = worker.split_once("of") else { continue };
         let (Ok(i), Ok(n)) = (i.parse::<u32>(), n.parse::<u32>()) else { continue };
+        if !matches!(suffix, None | Some("snapshot")) {
+            continue;
+        }
         let g = out.entry(generation).or_insert_with(|| Generation { count: n, ..Default::default() });
         if g.count != n {
             return Err(NodraError::delta(format!(

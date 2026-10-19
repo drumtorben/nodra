@@ -102,7 +102,10 @@ can simply be repeated.
 Progress keys contain the job name and source locations. Changing the query keeps the progress
 (new logic applies to new data only); renaming the job or a source location starts from scratch.
 The sink's columns are matched by name, so reordering output columns is fine; adding, removing
-or retyping columns is not (no schema evolution yet). If a source schema changes, workers stop
+or retyping columns is not (no schema evolution yet). For class-3 jobs, changing the
+aggregation itself (GROUP BY keys, aggregates, or their order) needs a new `nodra.job_name`,
+and so does changing `nodra.partials_location` or deleting the partials table: the stored
+partial states and the merge progress belong to the old aggregation. If a source schema changes, workers stop
 and must be restarted, which re-plans the job. The driving source and the class of a job never
 change once it has run; `nodra plan` notes it. If a broadcast table grows beyond
 `nodra.broadcast_threshold`, the job stops with a hint: raise the threshold (or set

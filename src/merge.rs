@@ -56,6 +56,13 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     }
     let all_files = delta::active_files(&partials)?;
     let sink_parts = delta::partition_columns(&sink)?;
+    // Partitions are compared by typed value: other writers (e.g. Spark's OPTIMIZE) may spell
+    // the same value differently.
+    let partials_fields = delta::Layout::of(&partials)?.partition_fields;
+    let sink_fields = delta::Layout::of(&sink)?.partition_fields;
+    let canonical = |v: &[Option<String>], f: &[datafusion::arrow::datatypes::FieldRef]| {
+        crate::scan::canonical_partition_values(v, f)
+    };
 
     // Which partial files to read and which sink files to replace.
     let scoped: Option<HashSet<Vec<Option<String>>>> = match (&p.plan.merge_scope, merged) {
@@ -66,7 +73,9 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
                 Ok(changes) => Some(
                     changes
                         .into_iter()
-                        .flat_map(|c| c.adds.into_iter().map(|f| f.partition_values))
+                        .flat_map(|c| {
+                            c.adds.into_iter().map(|f| canonical(&f.partition_values, &partials_fields))
+                        })
                         .collect(),
                 ),
                 // Log entries cleaned up: fall back to a full recompute.
@@ -77,7 +86,10 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     };
     let files: Vec<DataFile> = match &scoped {
         None => all_files,
-        Some(affected) => all_files.into_iter().filter(|f| affected.contains(&f.partition_values)).collect(),
+        Some(affected) => all_files
+            .into_iter()
+            .filter(|f| affected.contains(&canonical(&f.partition_values, &partials_fields)))
+            .collect(),
     };
     // The sink files the merge replaces, as of `sink` (recomputed if the sink moves on).
     let removes = |sink: &deltalake_core::DeltaTable| -> Result<Vec<Action>> {
@@ -86,7 +98,7 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
             Some(affected) => delta::removes_for(sink, |pv| {
                 let values: Vec<Option<String>> =
                     sink_parts.iter().map(|c| pv.get(c).cloned().flatten()).collect();
-                !affected.contains(&values)
+                !affected.contains(&canonical(&values, &sink_fields))
             }),
         }
     };
@@ -99,7 +111,8 @@ pub async fn merge(p: &Pipeline) -> Result<MergeOutcome> {
     let layout = delta::Layout::of(&partials)?;
     let states = FileListTable::try_new(layout.file_schema, layout.partition_fields, url, &files)?;
     let states_plan = states.scan(&ctx.state(), None, &[], None).await?;
-    let plan = partial::merge_plan(&physical, states_plan, &p.plan.split_group_names)?;
+    let plan =
+        partial::merge_plan(&physical, states_plan, &p.plan.split_group_names, ctx.state().config_options())?;
     let stream = execute_stream(plan, ctx.task_ctx())?;
     let written =
         sink::write_stream(&sink, &delta::arrow_schema(&sink)?, sink::Columns::ByName, stream).await?;

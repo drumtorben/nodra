@@ -146,6 +146,22 @@ fn unqualify(e: Expr) -> DfResult<Expr> {
     .map(|t| t.data)
 }
 
+/// Partition values in a canonical spelling (rendered from the typed value), so that values
+/// written by different Delta writers compare equal (`2025-10-09 08:53:20` from Spark and
+/// `2025-10-09 08:53:20.000000` from delta-rs). Values that do not parse are kept as they are.
+pub fn canonical_partition_values(values: &[Option<String>], fields: &[FieldRef]) -> Vec<Option<String>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| match (v, fields.get(i)) {
+            (Some(raw), Some(field)) => Some(
+                partition_scalar(Some(raw), field).map(|s| s.to_string()).unwrap_or_else(|_| raw.clone()),
+            ),
+            (other, _) => other.clone(),
+        })
+        .collect()
+}
+
 /// Convert a Delta partition value string to a typed scalar.
 pub fn partition_scalar(value: Option<&str>, field: &FieldRef) -> Result<ScalarValue> {
     match value {

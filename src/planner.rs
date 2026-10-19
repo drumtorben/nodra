@@ -115,6 +115,9 @@ pub struct JobPlan {
     /// Class 3: names of the split aggregate's group columns, in logical order (the canonical
     /// layout of partial states, see [`crate::partial`]).
     pub split_group_names: Vec<String>,
+    /// Class 3: the split aggregate's group columns and aggregates (logical names, in order).
+    /// Stored with the partials table: states written for another aggregation cannot be merged.
+    pub split_signature: String,
     /// Human-readable notes collected while planning.
     pub notes: Vec<String>,
 }
@@ -346,6 +349,7 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
 
     let mut merge_scope = None;
     let mut split_group_names = Vec::new();
+    let mut split_signature = String::new();
     if let Some(agg) = &walk.aggregate {
         if class == JobClass::CoPartitionedJoin {
             // Checked by `check_partition_local`: class 4 processes every partition once and
@@ -357,6 +361,9 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
             merge_scope = Some(merge_scope_for(&plan, job.sink.partition_by(), agg));
             let n = agg.schema.fields().len() - agg.aggr_expr.len();
             split_group_names = agg.schema.fields().iter().take(n).map(|f| f.name().clone()).collect();
+            let aggregates: Vec<String> = agg.aggr_expr.iter().map(|e| e.schema_name().to_string()).collect();
+            split_signature =
+                serde_json::json!({ "groups": split_group_names, "aggregates": aggregates }).to_string();
             let unique: BTreeSet<&String> = split_group_names.iter().collect();
             if unique.len() != split_group_names.len() {
                 return Err(NodraError::rejected(
@@ -375,7 +382,16 @@ pub async fn plan_job_with(job: &Job, infos: &[SourceInfo], previous: Option<Pre
             "stream joins need broadcast tables",
         ));
     }
-    Ok(JobPlan { class, roles, unit_key, output_schema, merge_scope, split_group_names, notes })
+    Ok(JobPlan {
+        class,
+        roles,
+        unit_key,
+        output_schema,
+        merge_scope,
+        split_group_names,
+        split_signature,
+        notes,
+    })
 }
 
 fn broadcastable(spec: &SourceSpec, info: &SourceInfo, threshold: u64) -> bool {

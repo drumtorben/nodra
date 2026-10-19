@@ -406,7 +406,9 @@ fn txns_from_parquet<R: datafusion::parquet::file::reader::ChunkReader + 'static
         };
         let app = datafusion::arrow::compute::cast(app, &datafusion::arrow::datatypes::DataType::Utf8)?;
         let app = app.as_string::<i32>();
-        let ver = ver.as_primitive::<Int64Type>();
+        let Some(ver) = ver.as_primitive_opt::<Int64Type>() else {
+            return Err(NodraError::delta(format!("checkpoint txn versions have type {}", ver.data_type())));
+        };
         for i in 0..txn.len() {
             if txn.is_valid(i) && app.is_valid(i) && ver.is_valid(i) {
                 map.insert(app.value(i).to_string(), ver.value(i));
