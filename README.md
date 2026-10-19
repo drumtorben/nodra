@@ -132,6 +132,7 @@ bandwidth is the limit. Treat these numbers as an order of magnitude, not a benc
 * [docs/operations.md](docs/operations.md) — running on Kubernetes, Azure, Kafka, monitoring, rescaling
 * [docs/design.md](docs/design.md) — execution model and exactly-once design
 * [examples/jobs](examples/jobs) — example jobs for every class
+* [CLAUDE.md](CLAUDE.md) — contributor guide: code map, invariants, testing conventions (also read by Claude Code)
 
 ## Command line
 
