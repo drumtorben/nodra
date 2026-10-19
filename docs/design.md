@@ -177,8 +177,14 @@ Nodra uses DataFusion's two-phase aggregation:
 * **Canonical layout.** Physical optimizers may order the group keys differently on workers and
   in the merge step (they see different statistics). Partial states are therefore stored with
   the group columns in the order of the *logical* aggregate, identified by name, and both sides
-  map their physical layout onto it. Uncorrelated scalar subqueries are planned as joins, so the
-  worker plan is a self-contained part of the full plan; `nodra plan` builds both plans.
+  map their physical layout onto it. The partials table records the aggregation it holds
+  (group keys and aggregates); a job whose aggregation changed is refused instead of merging old
+  states into the wrong accumulators. Uncorrelated scalar subqueries are planned as joins, so
+  the worker plan is a self-contained part of the full plan; `nodra plan` builds both plans.
+* The merge plan reproduces the split aggregate's output partitioning and ordering, which the
+  operators above it may rely on, and is checked with DataFusion's `SanityCheckPlan`.
+* Partition-scoped merges compare typed partition values, so files rewritten by another writer
+  (e.g. Spark's OPTIMIZE, which spells timestamps differently) are matched correctly.
 
 The merge commit carries `nodra/<job>/merge = <partials version>`, so merging is idempotent.
 

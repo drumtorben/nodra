@@ -11,6 +11,9 @@ mod differential;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod maintenance;
+mod merge_partitioning;
+mod partial_layout;
+mod partition_spelling;
 mod partitions;
 mod pipeline;
 mod planner_regressions;
@@ -20,6 +23,7 @@ mod rescale;
 mod rescale_fencing;
 mod rescale_generations;
 mod robustness;
+mod scoped_merge_rounds;
 mod sink;
 mod start_positions;
 mod states;

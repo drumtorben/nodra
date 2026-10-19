@@ -17,13 +17,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 
 use crate::error::{NodraError, Result};
@@ -134,6 +138,41 @@ pub fn canonical_order(
     Ok(order)
 }
 
+/// Field metadata key of the partials table's first column: the aggregation the states belong
+/// to (`JobPlan::split_signature`).
+pub const LAYOUT_KEY: &str = "nodra.layout";
+
+/// The Delta schema of the partials table for a worker plan's output, tagged with `signature`.
+pub fn partials_table_schema(worker: &SchemaRef, signature: &str) -> Result<SchemaRef> {
+    let schema = crate::types::delta_schema(&state_schema(worker))?;
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let f = f.as_ref().clone();
+            if i == 0 {
+                f.with_metadata(HashMap::from([(LAYOUT_KEY.to_string(), signature.to_string())]))
+            } else {
+                f
+            }
+        })
+        .collect();
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Refuse a partials table written for another aggregation (the query's GROUP BY or aggregates
+/// changed between runs): its states would be merged into the wrong accumulators.
+pub fn check_layout(stored: &Schema, signature: &str) -> Result<()> {
+    match stored.fields().first().and_then(|f| f.metadata().get(LAYOUT_KEY)) {
+        Some(s) if s != signature => Err(NodraError::job(format!(
+            "the aggregation of this job changed since its partial states were written ({s} -> {signature}); \
+             start the job under a new nodra.job_name (or restore the previous GROUP BY and aggregate order)"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Positional names for partial-state columns (`s0`, `s1`, …): DataFusion's state field names
 /// such as `count(x)[count]` are not valid Delta column names.
 pub fn state_schema(partial: &SchemaRef) -> SchemaRef {
@@ -154,6 +193,7 @@ pub fn merge_plan(
     plan: &Arc<dyn ExecutionPlan>,
     states: Arc<dyn ExecutionPlan>,
     group_names: &[String],
+    config: &ConfigOptions,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let split = find_split(plan).ok_or_else(|| {
         NodraError::job("internal: no aggregate over the driving source found in the physical plan")
@@ -175,19 +215,36 @@ pub fn merge_plan(
     let order = canonical_order(&partial_schema, agg.group_expr().num_group_exprs(), group_names)?;
     let restored = restore_states(states, &partial_schema, &order)?;
     // The operators above the split were planned for the split's output partitioning (often a
-    // single partition, because the merge is planned over an empty placeholder). The state scan
-    // can have any number of partitions, so reproduce that partitioning: either one partition,
-    // or a hash partitioning on the group columns (which keeps every group in one partition).
-    let partitions = split.output_partitioning().partition_count();
+    // single partition, because the merge is planned over an empty placeholder) and ordering, and
+    // may rely on them without checking again (e.g. a hash partitioning on a subset of the group
+    // keys). The state scan has its own partitioning, so reproduce the split's exactly: its hash
+    // expressions refer to group columns, which sit at the same positions in the states.
     let group_columns = agg.group_expr().num_group_exprs();
+    let wanted = split.output_partitioning().clone();
     let fit = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
-        if partitions <= 1 || group_columns == 0 {
-            return Ok(coalesce(input));
+        match &wanted {
+            Partitioning::Hash(exprs, n) if *n > 1 => {
+                let on_groups = exprs
+                    .iter()
+                    .all(|e| e.downcast_ref::<Column>().is_some_and(|c| c.index() < group_columns));
+                if !on_groups {
+                    return Err(NodraError::job(format!(
+                        "internal: the aggregate's output is partitioned by {exprs:?}, not by its group columns"
+                    )));
+                }
+                Ok(Arc::new(RepartitionExec::try_new(input, wanted.clone())?))
+            }
+            p if p.partition_count() <= 1 || group_columns == 0 => Ok(coalesce(input)),
+            p => {
+                // No guarantees promised: any partitioning that keeps each group together.
+                let keys: Vec<Arc<dyn PhysicalExpr>> = (0..group_columns)
+                    .map(|i| {
+                        Arc::new(Column::new(partial_schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>
+                    })
+                    .collect();
+                Ok(Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(keys, p.partition_count()))?))
+            }
         }
-        let keys: Vec<Arc<dyn PhysicalExpr>> = (0..group_columns)
-            .map(|i| Arc::new(Column::new(partial_schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>)
-            .collect();
-        Ok(Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(keys, partitions))?))
     };
     let final_agg = |mode: AggregateMode, input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(AggregateExec::try_new(
@@ -205,6 +262,12 @@ pub fn merge_plan(
         _ => final_agg(AggregateMode::Final, coalesce(restored))?,
     };
     let replacement = rename_like(replacement, &split.schema())?;
+    let replacement: Arc<dyn ExecutionPlan> = match split.output_ordering() {
+        Some(ordering) => {
+            Arc::new(SortExec::new(ordering.clone(), replacement).with_preserve_partitioning(true))
+        }
+        None => replacement,
+    };
     let target = Arc::as_ptr(&split) as *const () as usize;
     let rewritten = plan.clone().transform_down(|node| {
         if Arc::as_ptr(&node) as *const () as usize == target {
@@ -216,7 +279,10 @@ pub fn merge_plan(
     if !rewritten.transformed {
         return Err(NodraError::job("internal: failed to replace the split aggregate"));
     }
-    Ok(rewritten.data)
+    // Every distribution and ordering requirement must still hold (else wrong results).
+    SanityCheckPlan::new()
+        .optimize(rewritten.data, config)
+        .map_err(|e| NodraError::job(format!("internal: the merge plan is invalid: {e}")))
 }
 
 fn coalesce(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {

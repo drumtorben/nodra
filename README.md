@@ -14,8 +14,9 @@ aggregations. Nodra runs exactly those, as a single binary per worker, and tells
 needs a real shuffle engine.
 
 > Status: **v0.1, early**. The execution model, exactly-once handling, rescaling and all job
-> classes are implemented and tested (TESTCOUNT tests: crash, zombie-replica, rescaling,
-> concurrent-maintenance and differential tests against single-node DataFusion runs). It has not
+> classes are implemented and tested (131 tests: crash, zombie-replica, rescaling,
+> concurrent-maintenance, Kafka mock-cluster and differential tests against single-node DataFusion
+> runs; three independent review rounds). It has not
 > run in production yet. See [Limitations](#limitations).
 
 ## Quickstart
@@ -152,7 +153,9 @@ v0.1 deliberately does less than it eventually should:
   Nodra creates are fine).
 * **Sink schema** must match the query output exactly; no schema evolution yet.
 * **Stream formats:** JSON only (no Avro / schema registry yet). Kafka needs the `kafka` (or
-  `kafka-ssl`) feature and has been tested against configuration only, not a live broker.
+  `kafka-ssl`) feature; it is tested against librdkafka's mock cluster, not a real broker.
+* **Azure** (`azure` feature): URL and credential handling is unit-tested, but Nodra has not
+  run against a real storage account yet.
 * **Rescaling** a *Delta-driven* job needs all old workers stopped (stream jobs rescale freely,
   also during rolling updates).
 * **Class 4** processes each partition once; data arriving later in an already processed
@@ -170,6 +173,12 @@ v0.1 deliberately does less than it eventually should:
 cargo test                               # unit + integration tests (no external services)
 cargo test --features azure,kafka-ssl    # also compiles the Azure store and the Kafka source
 ```
+
+Integration tests are one binary (`cargo test --test integration rescale::` runs a group).
+`Cargo.lock` is resolved against crates.io. The code was developed in an environment without
+crates.io access, against the same crate versions built from their GitHub sources; the one
+exception is `buoyant_kernel_engine`, where crates.io has 0.28.0 and the tested build used the
+0.28.1 commit (`ab66589`) that `buoyant_kernel` 0.28.1 was released from.
 
 `jsonl_stream('<dir>')` is a broker-free stand-in for Kafka (one file per partition, one
 message per line) used by the tests and the demo.

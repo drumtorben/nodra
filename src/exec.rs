@@ -172,13 +172,17 @@ impl Pipeline {
     /// Class 3: build the worker plan and the merge plan once over empty inputs, so jobs whose
     /// plan cannot be split fail before any worker starts.
     async fn check_split(&self) -> Result<()> {
+        if let Some(t) = delta::try_open(&partials_location(&self.job)).await? {
+            let stored = delta::arrow_schema(&t)?;
+            partial::check_layout(&stored, &self.plan.split_signature)?;
+        }
         let ctx = session::new_context(&self.job.settings)?;
         register_placeholders(&ctx, self).await?;
         let physical = ctx.sql(&self.job.query).await?.create_physical_plan().await?;
         let worker = partial::worker_plan(&physical, &self.plan.split_group_names)?;
         let states = partial::state_schema(&worker.schema());
         let empty = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(states));
-        partial::merge_plan(&physical, empty, &self.plan.split_group_names)?;
+        partial::merge_plan(&physical, empty, &self.plan.split_group_names, ctx.state().config_options())?;
         Ok(())
     }
 
@@ -1133,7 +1137,7 @@ impl Worker {
         register_placeholders(&ctx, &self.p).await?;
         let physical = ctx.sql(&self.p.job.query).await?.create_physical_plan().await?;
         let partial = partial::worker_plan(&physical, &self.p.plan.split_group_names)?;
-        let schema = types::delta_schema(&partial::state_schema(&partial.schema()))?;
+        let schema = partial::partials_table_schema(&partial.schema(), &self.p.plan.split_signature)?;
         self.state_schema = Some(schema.clone());
         Ok(schema)
     }
@@ -1170,7 +1174,7 @@ impl Worker {
         let physical = ctx.sql(&p.job.query).await?.create_physical_plan().await?;
         let (plan, target_schema) = if p.plan.class == JobClass::MergeableAggregation {
             let partial = partial::worker_plan(&physical, &p.plan.split_group_names)?;
-            let schema = types::delta_schema(&partial::state_schema(&partial.schema()))?;
+            let schema = partial::partials_table_schema(&partial.schema(), &p.plan.split_signature)?;
             self.state_schema = Some(schema.clone());
             (partial, schema)
         } else {
@@ -1239,16 +1243,7 @@ fn typed_partition_key(f: &DataFile, fields: &[datafusion::arrow::datatypes::Fie
     if fields.len() != f.partition_values.len() {
         return Ok(f.partition_key());
     }
-    let values = f
-        .partition_values
-        .iter()
-        .zip(fields)
-        .map(|(v, field)| match v {
-            None => Ok(None),
-            Some(_) => crate::scan::partition_scalar(v.as_deref(), field).map(|s| Some(s.to_string())),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(delta::partition_key(&values))
+    Ok(delta::partition_key(&crate::scan::canonical_partition_values(&f.partition_values, fields)))
 }
 
 /// A positive fingerprint of the files of one class-4 partition (stored as its progress value).
