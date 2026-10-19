@@ -117,7 +117,18 @@ impl StreamSource for KafkaSource {
                 }
                 match c.poll(Duration::from_millis(500)) {
                     None => continue,
-                    Some(Err(KafkaError::PartitionEOF(_))) => break,
+                    Some(Err(KafkaError::PartitionEOF(_))) => {
+                        // Transaction markers occupy offsets but are never delivered: at the end
+                        // of the readable log, continue from the consumer's position (past such
+                        // markers), so progress reaches the high watermark.
+                        let pos = c.position().map_err(kerr)?;
+                        if let Some(Offset::Offset(o)) =
+                            pos.find_partition(topic, partition).map(|e| e.offset())
+                        {
+                            expected = expected.max(o.min(until));
+                        }
+                        break;
+                    }
                     Some(Err(e)) => return Err(kerr(e)),
                     Some(Ok(m)) => {
                         if m.partition() != partition {
