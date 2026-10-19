@@ -30,10 +30,17 @@ fn init_logging() {
     // is the normal case for Nodra's workers.
     // Same for statistics skipped on binary columns (partial aggregate states).
     let quiet = if libs > Level::WARN { libs } else { Level::ERROR };
+    // delta-kernel logs every error it returns (`#[instrument(err)]`); Nodra reports them itself.
+    let kernel = if libs > Level::WARN {
+        tracing_subscriber::filter::LevelFilter::from_level(libs)
+    } else {
+        tracing_subscriber::filter::LevelFilter::OFF
+    };
     let filter = Targets::new()
         .with_target("nodra", level)
         .with_target("deltalake_core::kernel::transaction", quiet)
         .with_target("deltalake_core::writer::stats", quiet)
+        .with_target("buoyant_kernel", kernel)
         .with_default(libs);
     tracing_subscriber::registry()
         .with(
@@ -57,8 +64,12 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
         Err(e) => {
-            error!("{e}");
-            eprintln!("error: {e}");
+            // One report: plain text on a terminal, a log line for log collectors otherwise.
+            if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                eprintln!("error: {e}");
+            } else {
+                error!("{e}");
+            }
             ExitCode::FAILURE
         }
     }
