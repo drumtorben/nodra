@@ -88,3 +88,68 @@ async fn kafka_start_latest_and_bad_messages() {
     run_once(&sql, 2).await.unwrap();
     assert_matches_reference(&sql, &[batch]).await;
 }
+
+/// A transactional producer writes a commit marker after its messages; it occupies an offset but
+/// is never delivered. Reading up to the high watermark must still end at the high watermark
+/// (otherwise `nodra_lag` never reaches 0). librdkafka's mock cluster writes no markers, so this
+/// test needs a real broker: `NODRA_TEST_KAFKA=localhost:9092` (skipped without it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_fetch_skips_transaction_markers() {
+    use nodra::source::kafka::KafkaSource;
+    use nodra::source::stream::StreamSource;
+
+    let Ok(bootstrap) = std::env::var("NODRA_TEST_KAFKA") else {
+        eprintln!("NODRA_TEST_KAFKA not set; skipped");
+        return;
+    };
+    let topic = format!("nodra-tx-{}", std::process::id());
+    let producer: BaseProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .set("transactional.id", &topic)
+        .create()
+        .unwrap();
+    producer.init_transactions(Duration::from_secs(30)).unwrap();
+    producer.begin_transaction().unwrap();
+    for line in &clicks(0..5).0 {
+        producer.send(BaseRecord::<(), str>::to(&topic).partition(0).payload(line.as_str())).unwrap();
+    }
+    producer.commit_transaction(Duration::from_secs(30)).unwrap();
+
+    let src = KafkaSource::new(&topic, &bootstrap, "nodra-test", &Default::default()).unwrap();
+    let (low, high) = src.watermarks(0).await.unwrap();
+    assert_eq!(high - low, 6, "5 messages and one commit marker");
+    let fetched = src.fetch(0, low, high, 100).await.unwrap();
+    assert_eq!(fetched.payloads.len(), 5);
+    assert_eq!(fetched.next_offset, high);
+    // Nothing left to read: the next fetch returns nothing and stays at the end.
+    let again = src.fetch(0, fetched.next_offset, high, 100).await.unwrap();
+    assert!(again.payloads.is_empty());
+    assert_eq!(again.next_offset, high);
+
+    // An open transaction is not readable yet: its messages must not be skipped.
+    producer.begin_transaction().unwrap();
+    for line in &clicks(5..8).0 {
+        producer.send(BaseRecord::<(), str>::to(&topic).partition(0).payload(line.as_str())).unwrap();
+    }
+    producer.flush(Duration::from_secs(30)).unwrap();
+    let (_, open_high) = src.watermarks(0).await.unwrap();
+    let pending = src.fetch(0, high, open_high, 100).await.unwrap();
+    assert!(pending.payloads.is_empty());
+    assert_eq!(pending.next_offset, high);
+    producer.commit_transaction(Duration::from_secs(30)).unwrap();
+    // The commit marker is written asynchronously (until then the high watermark, which is the
+    // last stable offset under read_committed, does not move): read until the messages become
+    // visible, and never move past them while they are not.
+    let (mut from, mut read, mut end) = (pending.next_offset, 0, 0);
+    for _ in 0..100 {
+        end = src.watermarks(0).await.unwrap().1;
+        let f = src.fetch(0, from, end, 100).await.unwrap();
+        read += f.payloads.len();
+        from = f.next_offset;
+        if read == 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!((read, from), (3, end), "3 messages and one commit marker");
+}
