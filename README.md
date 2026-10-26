@@ -14,7 +14,7 @@ aggregations. Nodra runs exactly those, as a single binary per worker, and tells
 needs a real shuffle engine.
 
 > Status: **v0.1, early**. The execution model, exactly-once handling, rescaling and all job
-> classes are implemented and tested (131 tests: crash, zombie-replica, rescaling,
+> classes are implemented and tested (133 tests: crash, zombie-replica, rescaling,
 > concurrent-maintenance, Kafka mock-cluster and differential tests against single-node DataFusion
 > runs; three independent review rounds). It has not
 > run in production yet. See [Limitations](#limitations).
@@ -114,17 +114,41 @@ Details: [docs/design.md](docs/design.md).
 
 ## Performance
 
-A first measurement with `cargo run --release --example bench` (8 million events, 16 Delta
-commits, 4 day partitions, a 1 000-row dimension table, 2 local workers on a 2-vCPU cloud VM
-that was busy with other work at the same time):
+`bench/run.sh` runs two jobs with Nodra and with Spark 4 (local mode) on the same Delta input,
+on the same machine with the same parallelism, and checks that both produce the same results:
 
-| Job | Time | Throughput |
-| --- | --- | --- |
-| class 2: enrich every event with the dimension, write a partitioned Delta table | 4.5 s | 1.8 M rows/s |
-| class 3: daily counts, sums and `approx_distinct` per brand (partials + merge) | 2.4 s | 3.3 M rows/s |
+* **Enrichment** (class 2): join every event with a 1 000-row campaign table, write a Delta
+  table partitioned by day.
+* **Daily aggregation** (class 3): join, then `count(*)`, `sum` and `approx_distinct` per day
+  and brand (partial states + merge step).
 
-Each worker is DataFusion on its own slice, so throughput scales with workers until storage
-bandwidth is the limit. Treat these numbers as an order of magnitude, not a benchmark.
+One laptop (Apple M4 Pro, 14 cores, 48 GB), Nodra with 14 local workers vs. Spark 4.0.4
+`local[14]` with Delta 4.0.1; median of 3 runs after a warm-up, Spark in a fresh JVM per run
+like a scheduled job. Results matched in every run.
+
+| | 40 M events (648 MB) | | 400 M events (5.3 GB) | |
+| --- | ---: | ---: | ---: | ---: |
+| | Nodra | Spark | Nodra | Spark |
+| Enrichment | 1.4 s | 9.2 s | 14.3 s | 48.5 s |
+| Daily aggregation | 0.5 s | 3.1 s | 3.6 s | 11.5 s |
+| Both, incl. Spark startup (~2 s) | 1.9 s | 14.3 s | 17.9 s | 62.0 s |
+| Peak memory (16 GB Spark heap) | 2.7 GB | 13.3 GB | 6.4 GB | 17.7 GB |
+| Peak memory (4 GB Spark heap) | 2.6 GB | 5.0 GB | 6.4 GB | 5.1 GB |
+
+With a 4 GB heap Spark runs slightly slower (56.0 s / 12.2 s at 400 M events). Most of Nodra's
+memory comes from every local worker using all cores (`datafusion.execution.target_partitions`
+defaults to the CPU count): with `SET datafusion.execution.target_partitions = 4` the 400 M run
+peaks at 3.9 GB at the same speed; with `= 1` at 2.8 GB, with a 25 % slower aggregation.
+
+What this does and does not show: both engines run on one machine and read and write local
+files, and both jobs need no shuffle — exactly the jobs Nodra is for. It says nothing about jobs
+that do need a shuffle (Nodra rejects them), and nothing about clusters or object storage yet.
+
+```sh
+bench/run.sh                          # 40 M events, all cores, 3 runs; needs cargo, uv, Java 17+
+ROWS=400000000 bench/run.sh           # bigger (input generated once; ~33 GB on disk incl. outputs)
+SPARK_MEM=4g bench/run.sh             # Spark driver heap (default 16g)
+```
 
 ## Documentation
 

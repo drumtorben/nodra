@@ -11,8 +11,9 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::config::TableParquetOptions;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::common::{Column, DFSchema, ScalarValue, Statistics};
 use datafusion::datasource::listing::helpers::expr_applicable_for_cols;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
@@ -37,6 +38,8 @@ pub struct FileListTable {
     schema: SchemaRef,
     store_url: ObjectStoreUrl,
     files: Vec<PartitionedFile>,
+    /// Row count of each file (same order as `files`) from the Delta log, if known.
+    rows: Vec<Option<u64>>,
 }
 
 impl fmt::Debug for FileListTable {
@@ -60,6 +63,7 @@ impl FileListTable {
         let mut fields: Vec<FieldRef> = file_schema.fields().iter().cloned().collect();
         fields.extend(partition_fields.iter().cloned());
         let schema = Arc::new(Schema::new(fields));
+        let rows = files_rows(files);
         let files = files
             .iter()
             .map(|f| {
@@ -81,7 +85,7 @@ impl FileListTable {
                 Ok(PartitionedFile::new_from_meta(meta).with_partition_values(values))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { file_schema, partition_fields, schema, store_url, files })
+        Ok(Self { file_schema, partition_fields, schema, store_url, files, rows })
     }
 
     /// Number of files.
@@ -89,17 +93,18 @@ impl FileListTable {
         self.files.len()
     }
 
-    /// The files whose partition values can satisfy `filters`. Only filters that reference
-    /// nothing but partition columns are used; DataFusion still applies all filters to the rows
-    /// (and uses the others for Parquet statistics pruning).
-    fn prune(&self, state: &dyn Session, filters: &[Expr]) -> DfResult<Vec<PartitionedFile>> {
+    /// Indices of the files whose partition values can satisfy `filters`. Only filters that
+    /// reference nothing but partition columns are used; DataFusion still applies all filters to
+    /// the rows (and uses the others for Parquet statistics pruning).
+    fn prune(&self, state: &dyn Session, filters: &[Expr]) -> DfResult<Vec<usize>> {
+        let all = || (0..self.files.len()).collect::<Vec<_>>();
         let names: Vec<&str> = self.partition_fields.iter().map(|f| f.name().as_str()).collect();
         let applicable: Vec<Expr> = filters
             .iter()
             .filter(|e| !names.is_empty() && expr_applicable_for_cols(&names, e))
             .map(|e| unqualify(e.clone()))
             .collect::<DfResult<_>>()?;
-        let Some(predicate) = conjunction(applicable) else { return Ok(self.files.clone()) };
+        let Some(predicate) = conjunction(applicable) else { return Ok(all()) };
         let schema = Arc::new(Schema::new(self.partition_fields.clone()));
         let predicate =
             state.create_physical_expr(predicate, &DFSchema::try_from(schema.as_ref().clone())?)?;
@@ -111,18 +116,30 @@ impl FileListTable {
         // A filter that fails on some partition values (e.g. a guarded division) only means
         // that pruning is not possible; DataFusion evaluates it on the rows anyway.
         let Ok(mask) = predicate.evaluate(&batch).and_then(|m| m.into_array(batch.num_rows())) else {
-            return Ok(self.files.clone());
+            return Ok(all());
         };
         let Some(mask) = mask.as_any().downcast_ref::<BooleanArray>() else {
-            return Ok(self.files.clone());
+            return Ok(all());
         };
-        Ok(self
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| mask.is_valid(*i) && mask.value(*i))
-            .map(|(_, f)| f.clone())
-            .collect())
+        Ok((0..self.files.len()).filter(|i| mask.is_valid(*i) && mask.value(*i)).collect())
+    }
+
+    /// Table statistics of the files `picked`: row count (from the Delta log) and size on disk.
+    ///
+    /// DataFusion's join selection needs them to build hash joins on the small side: without
+    /// statistics it keeps the query's join order and builds on the left input, so a driving
+    /// table written first (`FROM events JOIN campaigns`) was loaded into memory in full. Both
+    /// values are inexact (filters may remove rows; Parquet size is not memory size), which is
+    /// all join selection needs and keeps rules that require exact counts away.
+    fn statistics_of(&self, picked: &[usize]) -> Statistics {
+        let mut stats = Statistics::new_unknown(&self.schema);
+        let rows: Option<u64> = picked.iter().map(|&i| self.rows[i]).sum();
+        if let Some(rows) = rows {
+            stats.num_rows = Precision::Inexact(rows as usize);
+        }
+        let bytes: u64 = picked.iter().map(|&i| self.files[i].object_meta.size).sum();
+        stats.total_byte_size = Precision::Inexact(bytes as usize);
+        stats
     }
 
     /// Mark this table as the driving source (see [`crate::partial`]).
@@ -131,6 +148,10 @@ impl FileListTable {
         self.schema = crate::partial::mark_driving(&self.schema);
         self
     }
+}
+
+fn files_rows(files: &[DataFile]) -> Vec<Option<u64>> {
+    files.iter().map(|f| f.num_records).collect()
 }
 
 /// Drop table qualifiers (`e.day` → `day`) so the expression resolves against the partition schema.
@@ -198,14 +219,16 @@ impl TableProvider for FileListTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let files = if self.files.is_empty() { Vec::new() } else { self.prune(state, filters)? };
-        if files.is_empty() {
+        let picked = if self.files.is_empty() { Vec::new() } else { self.prune(state, filters)? };
+        if picked.is_empty() {
             let schema = match projection {
                 Some(p) => Arc::new(self.schema.project(p)?),
                 None => self.schema.clone(),
             };
             return Ok(Arc::new(EmptyExec::new(schema)));
         }
+        let statistics = self.statistics_of(&picked);
+        let files: Vec<PartitionedFile> = picked.iter().map(|&i| self.files[i].clone()).collect();
         let groups_n = state.config().target_partitions().max(1).min(files.len());
         let mut groups: Vec<Vec<PartitionedFile>> = vec![Vec::new(); groups_n];
         for (i, f) in files.into_iter().enumerate() {
@@ -223,6 +246,7 @@ impl TableProvider for FileListTable {
             .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
             .with_projection_indices(projection.cloned())?
             .with_limit(limit)
+            .with_statistics(statistics)
             .build();
         Ok(DataSourceExec::from_data_source(config))
     }
@@ -289,5 +313,59 @@ mod tests {
         assert!(!metrics.contains("day=2026-01-01/part.parquet"), "{metrics}");
         assert!(metrics.contains("predicate="), "{metrics}");
         assert!(metrics.contains("row_groups_pruned_statistics=10 total → 1 matched"), "{metrics}");
+    }
+
+    /// Write `n` rows of `x = 0..n` as one Parquet file at `rel` and describe it as a Delta file.
+    fn parquet_file(dir: &std::path::Path, rel: &str, n: i64) -> DataFile {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..n))]).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        DataFile {
+            path: Path::from(rel),
+            size: std::fs::metadata(&path).unwrap().len(),
+            partition_values: vec![],
+            num_records: Some(n as u64),
+        }
+    }
+
+    /// Regression: without statistics DataFusion built the hash join on the left input, so the
+    /// large driving table of `FROM events JOIN campaigns` was loaded into memory in full.
+    #[tokio::test]
+    async fn joins_build_on_the_small_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            parquet_file(dir.path(), "events/a.parquet", 20_000),
+            parquet_file(dir.path(), "events/b.parquet", 20_000),
+        ];
+        let campaigns = vec![parquet_file(dir.path(), "campaigns/a.parquet", 10)];
+        let ctx = SessionContext::new();
+        let url = ObjectStoreUrl::parse("nodra://t").unwrap();
+        ctx.register_object_store(
+            url.as_ref(),
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        for (name, files) in [("events", &events), ("campaigns", &campaigns)] {
+            let table = FileListTable::try_new(schema.clone(), vec![], url.clone(), files).unwrap();
+            ctx.register_table(name, Arc::new(table)).unwrap();
+        }
+
+        let sql = "SELECT e.x FROM events e JOIN campaigns c ON e.x = c.x";
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let text = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+        let join = text.find("HashJoinExec").unwrap_or_else(|| panic!("no hash join:\n{text}"));
+        assert!(text[join..].starts_with("HashJoinExec: mode=CollectLeft"), "{text}");
+        // The build side is the join's first input: the first scan below the join.
+        let build = &text[join..][text[join..].find("DataSourceExec").unwrap()..];
+        let build = build.lines().next().unwrap();
+        assert!(build.contains("campaigns/a.parquet"), "build side is not the small table:\n{text}");
+
+        let rows = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 20);
     }
 }

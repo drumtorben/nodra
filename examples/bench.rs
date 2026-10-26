@@ -58,7 +58,9 @@ fn events(schema: &SchemaRef, from: i64, to: i64) -> nodra::Result<RecordBatch> 
 }
 
 async fn run(sql: &str, workers: u32) -> nodra::Result<f64> {
-    let p = Arc::new(Pipeline::prepare(Job::parse(sql, "bench")?).await?);
+    // Extra `SET …;` statements for experiments, e.g. NODRA_BENCH_SET="SET datafusion.x = 1;".
+    let sql = format!("{} {sql}", std::env::var("NODRA_BENCH_SET").unwrap_or_default());
+    let p = Arc::new(Pipeline::prepare(Job::parse(&sql, "bench")?).await?);
     let (_tx, rx) = watch::channel(false);
     let started = Instant::now();
     exec::run(p, (0..workers).collect(), workers, true, rx).await?;
@@ -138,12 +140,16 @@ async fn main() -> nodra::Result<()> {
         src.display(),
         dim.display()
     );
-    for (name, sql) in [("class 2 enrichment", &enrich), ("class 3 daily aggregation", &daily)] {
+    for (key, name, sql) in
+        [("enrich", "class 2 enrichment", &enrich), ("daily", "class 3 daily aggregation", &daily)]
+    {
         let secs = run(sql, workers).await?;
         println!(
             "{name}: {rows} rows with {workers} local workers in {secs:.1}s ({:.2} M rows/s)",
             rows as f64 / secs / 1e6
         );
+        // Machine-readable line for bench/run.sh.
+        println!("RESULT nodra_{key} {secs:.2}");
     }
     Ok(())
 }
