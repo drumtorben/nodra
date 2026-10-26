@@ -25,6 +25,7 @@ cargo test --lib planner                      # unit tests of one module
 cargo fmt && cargo clippy --all-targets --features azure,kafka-ssl -- -D warnings
 cargo run --example demo_data -- /tmp/nodra-demo && cargo run -- plan examples/jobs/daily_brand_stats.sql
 cargo run --release --example bench -- /tmp/nodra-bench 8000000 16 2
+bench/run.sh                                  # Nodra vs. Spark 4 (local), needs uv + Java 17+
 ```
 
 Requirements: Rust ≥ 1.95 (deltalake-core needs it). The `kafka` feature builds librdkafka from
@@ -133,6 +134,11 @@ read the relevant section of `docs/design.md`.
   without crates.io, from the same versions' GitHub sources (except `buoyant_kernel_engine`:
   0.28.0 on crates.io vs. the 0.28.1 sources used there). Run the full test suite after the first
   build from crates.io.
+
+## Current work
+
+If `docs/status.md` exists (local hand-off notes, not in git), read it before continuing work.
+Benchmark results from `bench/run.sh` land in `bench/results/` (not in git either).
 
 ## Open ends (good next steps)
 

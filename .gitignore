@@ -1,2 +1,6 @@
 /target
 *.swp
+
+# Local only: benchmark results (machine names) and personal hand-off notes
+/bench/results/
+/docs/status.md
